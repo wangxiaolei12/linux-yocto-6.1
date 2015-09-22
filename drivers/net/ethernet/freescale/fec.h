@@ -705,6 +705,11 @@ struct fec_enet_private {
 		u8 at_inc_corr;
 	} ptp_saved_state;
 
+#ifdef CONFIG_AVB_SUPPORT
+	int rec_channel;
+	int rec_enable;
+#endif
+
 	u64 ethtool_stats[];
 };
 
