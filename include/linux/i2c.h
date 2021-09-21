@@ -345,7 +345,6 @@ struct i2c_client {
 };
 #define to_i2c_client(d) container_of(d, struct i2c_client, dev)
 
-struct i2c_client *i2c_verify_client(struct device *dev);
 struct i2c_adapter *i2c_verify_adapter(struct device *dev);
 const struct i2c_device_id *i2c_match_id(const struct i2c_device_id *id,
 					 const struct i2c_client *client);
@@ -479,6 +478,13 @@ i2c_new_ancillary_device(struct i2c_client *client,
 			 u16 default_addr);
 
 void i2c_unregister_device(struct i2c_client *client);
+
+struct i2c_client *i2c_verify_client(struct device *dev);
+#else
+static inline struct i2c_client *i2c_verify_client(struct device *dev)
+{
+	return NULL;
+}
 #endif /* I2C */
 
 /* Mainboard arch_initcall() code should register all its I2C devices.
@@ -1004,6 +1010,7 @@ struct acpi_resource_i2c_serialbus;
 #if IS_ENABLED(CONFIG_ACPI)
 bool i2c_acpi_get_i2c_resource(struct acpi_resource *ares,
 			       struct acpi_resource_i2c_serialbus **i2c);
+int i2c_acpi_client_count(struct acpi_device *adev);
 u32 i2c_acpi_find_bus_speed(struct device *dev);
 struct i2c_client *i2c_acpi_new_device(struct device *dev, int index,
 				       struct i2c_board_info *info);
@@ -1013,6 +1020,10 @@ static inline bool i2c_acpi_get_i2c_resource(struct acpi_resource *ares,
 					     struct acpi_resource_i2c_serialbus **i2c)
 {
 	return false;
+}
+static inline int i2c_acpi_client_count(struct acpi_device *adev)
+{
+	return 0;
 }
 static inline u32 i2c_acpi_find_bus_speed(struct device *dev)
 {
