@@ -442,6 +442,10 @@ static void mlx5_do_bond(struct mlx5_lag *ldev)
 	if (!mlx5_lag_is_ready(ldev)) {
 		do_bond = false;
 	} else {
+		/* VF LAG is in multipath mode, ignore bond change requests */
+		if (mlx5_lag_is_multipath(dev0))
+			return;
+
 		tracker = ldev->tracker;
 
 		do_bond = tracker.is_bonded && mlx5_lag_check_prereq(ldev);
@@ -927,9 +931,12 @@ void mlx5_lag_disable_change(struct mlx5_core_dev *dev)
 	struct mlx5_core_dev *dev1;
 	struct mlx5_lag *ldev;
 
+	ldev = mlx5_lag_dev(dev);
+	if (!ldev)
+		return;
+
 	mlx5_dev_list_lock();
 
-	ldev = mlx5_lag_dev(dev);
 	dev0 = ldev->pf[MLX5_LAG_P1].dev;
 	dev1 = ldev->pf[MLX5_LAG_P2].dev;
 
@@ -946,8 +953,11 @@ void mlx5_lag_enable_change(struct mlx5_core_dev *dev)
 {
 	struct mlx5_lag *ldev;
 
-	mlx5_dev_list_lock();
 	ldev = mlx5_lag_dev(dev);
+	if (!ldev)
+		return;
+
+	mlx5_dev_list_lock();
 	ldev->mode_changes_in_progress--;
 	mlx5_dev_list_unlock();
 	mlx5_queue_bond_work(ldev, 0);

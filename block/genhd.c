@@ -26,6 +26,7 @@
 #include <linux/badblocks.h>
 
 #include "blk.h"
+#include "blk-rq-qos.h"
 
 static struct kobject *block_depr;
 
@@ -183,6 +184,7 @@ static struct blk_major_name {
 	void (*probe)(dev_t devt);
 } *major_names[BLKDEV_MAJOR_HASH_SIZE];
 static DEFINE_MUTEX(major_names_lock);
+static DEFINE_SPINLOCK(major_names_spinlock);
 
 /* index in the above - for now: assume no multimajor ranges */
 static inline int major_to_index(unsigned major)
@@ -195,11 +197,11 @@ void blkdev_show(struct seq_file *seqf, off_t offset)
 {
 	struct blk_major_name *dp;
 
-	mutex_lock(&major_names_lock);
+	spin_lock(&major_names_spinlock);
 	for (dp = major_names[major_to_index(offset)]; dp; dp = dp->next)
 		if (dp->major == offset)
 			seq_printf(seqf, "%3d %s\n", dp->major, dp->name);
-	mutex_unlock(&major_names_lock);
+	spin_unlock(&major_names_spinlock);
 }
 #endif /* CONFIG_PROC_FS */
 
@@ -271,6 +273,7 @@ int __register_blkdev(unsigned int major, const char *name,
 	p->next = NULL;
 	index = major_to_index(major);
 
+	spin_lock(&major_names_spinlock);
 	for (n = &major_names[index]; *n; n = &(*n)->next) {
 		if ((*n)->major == major)
 			break;
@@ -279,6 +282,7 @@ int __register_blkdev(unsigned int major, const char *name,
 		*n = p;
 	else
 		ret = -EBUSY;
+	spin_unlock(&major_names_spinlock);
 
 	if (ret < 0) {
 		printk("register_blkdev: cannot get major %u for %s\n",
@@ -298,6 +302,7 @@ void unregister_blkdev(unsigned int major, const char *name)
 	int index = major_to_index(major);
 
 	mutex_lock(&major_names_lock);
+	spin_lock(&major_names_spinlock);
 	for (n = &major_names[index]; *n; n = &(*n)->next)
 		if ((*n)->major == major)
 			break;
@@ -307,6 +312,7 @@ void unregister_blkdev(unsigned int major, const char *name)
 		p = *n;
 		*n = p->next;
 	}
+	spin_unlock(&major_names_spinlock);
 	mutex_unlock(&major_names_lock);
 	kfree(p);
 }
@@ -554,6 +560,8 @@ EXPORT_SYMBOL(device_add_disk);
  */
 void del_gendisk(struct gendisk *disk)
 {
+	struct request_queue *q = disk->queue;
+
 	might_sleep();
 
 	if (WARN_ON_ONCE(!disk_live(disk) && !(disk->flags & GENHD_FL_HIDDEN)))
@@ -570,7 +578,16 @@ void del_gendisk(struct gendisk *disk)
 	fsync_bdev(disk->part0);
 	__invalidate_device(disk->part0, true);
 
+	/*
+	 * Fail any new I/O.
+	 */
+	set_bit(GD_DEAD, &disk->state);
 	set_capacity(disk, 0);
+
+	/*
+	 * Prevent new I/O from crossing bio_queue_enter().
+	 */
+	blk_queue_start_drain(q);
 
 	if (!(disk->flags & GENHD_FL_HIDDEN)) {
 		sysfs_remove_link(&disk_to_dev(disk)->kobj, "bdi");
@@ -593,6 +610,18 @@ void del_gendisk(struct gendisk *disk)
 		sysfs_remove_link(block_depr, dev_name(disk_to_dev(disk)));
 	pm_runtime_set_memalloc_noio(disk_to_dev(disk), false);
 	device_del(disk_to_dev(disk));
+
+	blk_mq_freeze_queue_wait(q);
+
+	rq_qos_exit(q);
+	blk_sync_queue(q);
+	blk_flush_integrity();
+	/*
+	 * Allow using passthrough request again after the queue is torn down.
+	 */
+	blk_queue_flag_clear(QUEUE_FLAG_INIT_DONE, q);
+	__blk_mq_unfreeze_queue(q, true);
+
 }
 EXPORT_SYMBOL(del_gendisk);
 
@@ -1051,6 +1080,7 @@ static void disk_release(struct device *dev)
 	struct gendisk *disk = dev_to_disk(dev);
 
 	might_sleep();
+	WARN_ON_ONCE(disk_live(disk));
 
 	disk_release_events(disk);
 	kfree(disk->random);
@@ -1263,6 +1293,7 @@ struct gendisk *__alloc_disk_node(struct request_queue *q, int node_id,
 
 out_destroy_part_tbl:
 	xa_destroy(&disk->part_tbl);
+	disk->part0->bd_disk = NULL;
 	iput(disk->part0->bd_inode);
 out_free_bdi:
 	bdi_put(disk->bdi);

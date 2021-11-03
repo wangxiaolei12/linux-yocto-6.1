@@ -594,8 +594,6 @@ static int page_outside_zone_boundaries(struct zone *zone, struct page *page)
 
 static int page_is_consistent(struct zone *zone, struct page *page)
 {
-	if (!pfn_valid_within(page_to_pfn(page)))
-		return 0;
 	if (zone != page_zone(page))
 		return 0;
 
@@ -1025,16 +1023,12 @@ buddy_merge_likely(unsigned long pfn, unsigned long buddy_pfn,
 	if (order >= MAX_ORDER - 2)
 		return false;
 
-	if (!pfn_valid_within(buddy_pfn))
-		return false;
-
 	combined_pfn = buddy_pfn & pfn;
 	higher_page = page + (combined_pfn - pfn);
 	buddy_pfn = __find_buddy_pfn(combined_pfn, order + 1);
 	higher_buddy = higher_page + (buddy_pfn - combined_pfn);
 
-	return pfn_valid_within(buddy_pfn) &&
-	       page_is_buddy(higher_page, higher_buddy, order + 1);
+	return page_is_buddy(higher_page, higher_buddy, order + 1);
 }
 
 /*
@@ -1095,8 +1089,6 @@ continue_merging:
 		buddy_pfn = __find_buddy_pfn(pfn, order);
 		buddy = page + (buddy_pfn - pfn);
 
-		if (!pfn_valid_within(buddy_pfn))
-			goto done_merging;
 		if (!page_is_buddy(page, buddy, order))
 			goto done_merging;
 		/*
@@ -1320,8 +1312,10 @@ static __always_inline bool free_pages_prepare(struct page *page,
 
 		VM_BUG_ON_PAGE(compound && compound_order(page) != order, page);
 
-		if (compound)
+		if (compound) {
 			ClearPageDoubleMap(page);
+			ClearPageHasHWPoisoned(page);
+		}
 		for (i = 1; i < (1 << order); i++) {
 			if (compound)
 				bad += free_tail_pages_check(page, page + i);
@@ -1754,9 +1748,7 @@ void __init memblock_free_pages(struct page *page, unsigned long pfn,
 /*
  * Check that the whole (or subset of) a pageblock given by the interval of
  * [start_pfn, end_pfn) is valid and within the same zone, before scanning it
- * with the migration of free compaction scanner. The scanners then need to
- * use only pfn_valid_within() check for arches that allow holes within
- * pageblocks.
+ * with the migration of free compaction scanner.
  *
  * Return struct page pointer of start_pfn, or NULL if checks were not passed.
  *
@@ -1872,8 +1864,6 @@ static inline void __init pgdat_init_report_one_done(void)
  */
 static inline bool __init deferred_pfn_valid(unsigned long pfn)
 {
-	if (!pfn_valid_within(pfn))
-		return false;
 	if (!(pfn & (pageblock_nr_pages - 1)) && !pfn_valid(pfn))
 		return false;
 	return true;
@@ -2520,11 +2510,6 @@ static int move_freepages(struct zone *zone,
 	int pages_moved = 0;
 
 	for (pfn = start_pfn; pfn <= end_pfn;) {
-		if (!pfn_valid_within(pfn)) {
-			pfn++;
-			continue;
-		}
-
 		page = pfn_to_page(pfn);
 		if (!PageBuddy(page)) {
 			/*
@@ -3445,8 +3430,10 @@ void free_unref_page_list(struct list_head *list)
 	/* Prepare pages for freeing */
 	list_for_each_entry_safe(page, next, list, lru) {
 		pfn = page_to_pfn(page);
-		if (!free_unref_page_prepare(page, pfn, 0))
+		if (!free_unref_page_prepare(page, pfn, 0)) {
 			list_del(&page->lru);
+			continue;
+		}
 
 		/*
 		 * Free isolated pages directly to the allocator, see
@@ -5237,6 +5224,10 @@ unsigned long __alloc_pages_bulk(gfp_t gfp, int preferred_nid,
 	/* Already populated array? */
 	if (unlikely(page_array && nr_pages - nr_populated == 0))
 		goto out;
+
+	/* Bulk allocator does not support memcg accounting. */
+	if (memcg_kmem_enabled() && (gfp & __GFP_ACCOUNT))
+		goto failed;
 
 	/* Use the single page allocator for one page. */
 	if (nr_pages - nr_populated == 1)
@@ -7271,6 +7262,9 @@ static void __init calculate_node_totalpages(struct pglist_data *pgdat,
 			zone->zone_start_pfn = 0;
 		zone->spanned_pages = size;
 		zone->present_pages = real_size;
+#if defined(CONFIG_MEMORY_HOTPLUG)
+		zone->present_early_pages = real_size;
+#endif
 
 		totalpages += size;
 		realtotalpages += real_size;
@@ -8828,9 +8822,6 @@ struct page *has_unmovable_pages(struct zone *zone, struct page *page,
 	}
 
 	for (; iter < pageblock_nr_pages - offset; iter++) {
-		if (!pfn_valid_within(pfn + iter))
-			continue;
-
 		page = pfn_to_page(pfn + iter);
 
 		/*
