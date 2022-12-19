@@ -918,6 +918,11 @@ S: Ottawa, Ontario
 S: K1N 6Z9
 S: CANADA
 
+N: Vivien Didelot
+E: vivien.didelot@gmail.com
+D: DSA framework and MV88E6XXX driver
+S: Montreal, Quebec, Canada
+
 N: Jeff Dike
 E: jdike@karaya.com
 W: http://user-mode-linux.sourceforge.net
@@ -3494,6 +3499,10 @@ D: Always IN2000 SCSI driver
 D: wd33c93 SCSI driver (linux-m68k)
 S: San Jose, California
 S: USA
+
+N: Joonyoung Shim
+E: y0922.shim@samsung.com
+D: Samsung Exynos DRM drivers
 
 N: Robert Siemer
 E: Robert.Siemer@gmx.de
