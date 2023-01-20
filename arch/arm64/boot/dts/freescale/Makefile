@@ -299,7 +299,7 @@ dtb-$(CONFIG_ARCH_MXC) += imx8qm-mek-revd-root.dtb
 #dtb-$(CONFIG_ARCH_MXC) += imx8qxp-colibri-iris.dtb
 #dtb-$(CONFIG_ARCH_MXC) += imx8qxp-colibri-iris-v2.dtb
 dtb-$(CONFIG_ARCH_MXC) += imx8dxl-evk.dtb \
-			  imx8dxl-evk-enet0.dtb imx8dxl-evk-enet0-tja1100.dtb \
+			  imx8dxl-evk-enet0.dtb imx8dxl-evk-enet0-tja1100.dtb imx8dxl-evk-enet0-avb.dtb \
 			  imx8dxl-evk-pcie-ep.dtb \
 			  imx8dxl-evk-lcdif.dtb \
 			  imx8dxl-evk-lpspi-slave.dtb \
