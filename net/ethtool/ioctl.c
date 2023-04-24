@@ -2795,6 +2795,19 @@ static int ethtool_set_preempt(struct net_device *dev, void __user *useraddr)
 	return dev->ethtool_ops->set_preempt(dev, &fpparam);
 }
 
+static int ethtool_reset_preempt(struct net_device *dev, void __user *useraddr)
+{
+	struct ethtool_fp fpparam;
+
+	if (!dev->ethtool_ops->reset_preempt)
+		return -EOPNOTSUPP;
+
+	if (copy_from_user(&fpparam, useraddr, sizeof(fpparam)))
+		return -EFAULT;
+
+	return dev->ethtool_ops->reset_preempt(dev, fpparam.fp_enabled);
+}
+
 /* The main entry point in this file.  Called from net/core/dev_ioctl.c */
 
 static int
@@ -2856,6 +2869,7 @@ __dev_ethtool(struct net *net, struct ifreq *ifr, void __user *useraddr,
 	case ETHTOOL_GFECPARAM:
 	case ETHTOOL_GFP:
 	case ETHTOOL_SFP:
+	case ETHTOOL_RFP:
 		break;
 	default:
 		if (!ns_capable(net->user_ns, CAP_NET_ADMIN))
@@ -3088,6 +3102,9 @@ __dev_ethtool(struct net *net, struct ifreq *ifr, void __user *useraddr,
 		break;
 	case ETHTOOL_SFP:
 		rc = ethtool_set_preempt(dev, useraddr);
+		break;
+	case ETHTOOL_RFP:
+		rc = ethtool_reset_preempt(dev, useraddr);
 		break;
 	default:
 		rc = -EOPNOTSUPP;
