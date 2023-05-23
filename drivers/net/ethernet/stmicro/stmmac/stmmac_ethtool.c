@@ -1307,12 +1307,6 @@ static int stmmac_set_preempt(struct net_device *dev, struct ethtool_fp *fpcmd)
 	else
 		fpe.enable = fpcmd->fp_enabled ? 0 : 1;
 
-	if (fpcmd->fp_lldp_verify)
-		fpe.enable = 0;
-
-	priv->fp_lldp_verify = fpcmd->fp_lldp_verify;
-	priv->fp_verify = fpcmd->fp_enabled;
-
 	/* To support preemption MAC should have more than 1 TX queue with at
 	 * least 1 Queue designated as Express Queue. Queue 0 is always used as
 	 * preemption queue when preemption MAC is enabled.
@@ -1356,14 +1350,13 @@ static int stmmac_get_preempt(struct net_device *dev, struct ethtool_fp *fpcmd)
 	}
 
 	fpcmd->fp_supported = 1;
-	fpcmd->fp_status = priv->fp_lldp_verify ? 1 :
-			   (priv->fp_verify ? 1 : fpe.enable);
+	fpcmd->fp_status = priv->plat->fpe_cfg->enable;
 	fpcmd->fp_active = fpe.enable;
 	fpcmd->supported_queues_mask = GENMASK(priv->plat->tx_queues_to_use - 1,
 					       0);
 	fpcmd->preemptible_queues_mask = fpe.p_queues;
-	/* Queue 0 is always preemption when preemption is enabled. */
-	if (fpcmd->fp_status)
+	/* Queue 0 is always preemption when preemption is active. */
+	if (fpcmd->fp_active)
 		fpcmd->preemptible_queues_mask |= 1;
 	fpcmd->min_frag_size = (fpe.fragsize + 1) * 64 - 4;
 
