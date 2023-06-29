@@ -1321,8 +1321,10 @@ static int stmmac_set_preempt(struct net_device *dev, struct ethtool_fp *fpcmd)
 	if (fpcmd->disabled) {
 		fpe.enable = 0;
 		priv->plat->fpe_cfg->enable = 0;
+		priv->fp_enabled_admin = 0;
 	} else {
 		priv->plat->fpe_cfg->enable = 1;
+		priv->fp_enabled_admin = 1;
 	}
 	stmmac_fpe_configure(priv, priv->ioaddr, fpe_cfg,
 			     priv->plat->tx_queues_to_use,
