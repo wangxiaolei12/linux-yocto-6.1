@@ -513,6 +513,8 @@ struct enetc_ndev_priv {
 	 * and link state updates
 	 */
 	struct mutex		mm_lock;
+
+	bool fp_enabled_admin;
 };
 
 /* Messaging */
