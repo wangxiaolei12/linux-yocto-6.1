@@ -735,6 +735,7 @@ netdev_tx_t wilc_mac_xmit(struct sk_buff *skb, struct net_device *ndev)
 
 	if (skb->dev != ndev) {
 		netdev_err(ndev, "Packet not destined to this device\n");
+		dev_kfree_skb(skb);
 		return NETDEV_TX_OK;
 	}
 
@@ -985,7 +986,7 @@ struct wilc_vif *wilc_netdev_ifc_init(struct wilc *wl, const char *name,
 						    ndev->name);
 	if (!wl->hif_workqueue) {
 		ret = -ENOMEM;
-		goto error;
+		goto unregister_netdev;
 	}
 
 	ndev->needs_free_netdev = true;
@@ -1000,6 +1001,11 @@ struct wilc_vif *wilc_netdev_ifc_init(struct wilc *wl, const char *name,
 
 	return vif;
 
+unregister_netdev:
+	if (rtnl_locked)
+		cfg80211_unregister_netdevice(ndev);
+	else
+		unregister_netdev(ndev);
   error:
 	free_netdev(ndev);
 	return ERR_PTR(ret);

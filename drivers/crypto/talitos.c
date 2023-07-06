@@ -1412,7 +1412,7 @@ static struct talitos_edesc *talitos_edesc_alloc(struct device *dev,
 		alloc_len += sizeof(struct talitos_desc);
 	alloc_len += ivsize;
 
-	edesc = kmalloc(alloc_len, GFP_DMA | flags);
+	edesc = kmalloc(ALIGN(alloc_len, dma_get_cache_alignment()), flags);
 	if (!edesc)
 		return ERR_PTR(-ENOMEM);
 	if (ivsize) {
@@ -1591,7 +1591,7 @@ static void skcipher_done(struct device *dev,
 
 	kfree(edesc);
 
-	areq->base.complete(&areq->base, err);
+	skcipher_request_complete(areq, err);
 }
 
 static int common_nonsnoop(struct talitos_edesc *edesc,
@@ -1790,7 +1790,7 @@ static void ahash_done(struct device *dev,
 
 	kfree(edesc);
 
-	areq->base.complete(&areq->base, err);
+	ahash_request_complete(areq, err);
 }
 
 /*
@@ -2030,7 +2030,7 @@ static int ahash_process_req(struct ahash_request *areq, unsigned int nbytes)
 		/* Buffer up to one whole block */
 		nents = sg_nents_for_len(areq->src, nbytes);
 		if (nents < 0) {
-			dev_err(ctx->dev, "Invalid number of src SG.\n");
+			dev_err(dev, "Invalid number of src SG.\n");
 			return nents;
 		}
 		sg_copy_to_buffer(areq->src, nents,
@@ -2071,7 +2071,7 @@ static int ahash_process_req(struct ahash_request *areq, unsigned int nbytes)
 			offset = nbytes_to_hash - req_ctx->nbuf;
 		nents = sg_nents_for_len(areq->src, offset);
 		if (nents < 0) {
-			dev_err(ctx->dev, "Invalid number of src SG.\n");
+			dev_err(dev, "Invalid number of src SG.\n");
 			return nents;
 		}
 		sg_copy_to_buffer(areq->src, nents,
@@ -2085,7 +2085,7 @@ static int ahash_process_req(struct ahash_request *areq, unsigned int nbytes)
 	if (to_hash_later) {
 		nents = sg_nents_for_len(areq->src, nbytes);
 		if (nents < 0) {
-			dev_err(ctx->dev, "Invalid number of src SG.\n");
+			dev_err(dev, "Invalid number of src SG.\n");
 			return nents;
 		}
 		sg_pcopy_to_buffer(areq->src, nents,

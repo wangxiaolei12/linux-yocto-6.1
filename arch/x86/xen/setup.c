@@ -7,6 +7,7 @@
 
 #include <linux/init.h>
 #include <linux/sched.h>
+#include <linux/kstrtox.h>
 #include <linux/mm.h>
 #include <linux/pm.h>
 #include <linux/memblock.h>
@@ -85,7 +86,7 @@ static void __init xen_parse_512gb(void)
 	arg = strstr(xen_start_info->cmd_line, "xen_512gb_limit=");
 	if (!arg)
 		val = true;
-	else if (strtobool(arg + strlen("xen_512gb_limit="), &val))
+	else if (kstrtobool(arg + strlen("xen_512gb_limit="), &val))
 		return;
 
 	xen_512gb_limit = val;
@@ -933,11 +934,7 @@ void xen_enable_syscall(void)
 
 static void __init xen_pvmmu_arch_setup(void)
 {
-	HYPERVISOR_vm_assist(VMASST_CMD_enable, VMASST_TYPE_4gb_segments);
 	HYPERVISOR_vm_assist(VMASST_CMD_enable, VMASST_TYPE_writable_pagetables);
-
-	HYPERVISOR_vm_assist(VMASST_CMD_enable,
-			     VMASST_TYPE_pae_extended_cr3);
 
 	if (register_callback(CALLBACKTYPE_event,
 			      xen_asm_exc_xen_hypervisor_callback) ||
