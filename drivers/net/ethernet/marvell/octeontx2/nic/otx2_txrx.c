@@ -217,9 +217,6 @@ static bool otx2_skb_add_frag(struct otx2_nic *pfvf, struct sk_buff *skb,
 		skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags, page,
 				va - page_address(page) + off,
 				len - off, pfvf->rbsize);
-
-		otx2_dma_unmap_page(pfvf, iova - OTX2_HEAD_ROOM,
-				    pfvf->rbsize, DMA_FROM_DEVICE);
 		return true;
 	}
 
@@ -382,6 +379,8 @@ static void otx2_rcv_pkt_handler(struct otx2_nic *pfvf,
 	if (pfvf->netdev->features & NETIF_F_RXCSUM)
 		skb->ip_summed = CHECKSUM_UNNECESSARY;
 
+	skb_mark_for_recycle(skb);
+
 	napi_gro_frags(napi);
 }
 
@@ -425,9 +424,10 @@ process_cqe:
 	return processed_cqe;
 }
 
-void otx2_refill_pool_ptrs(void *dev, struct otx2_cq_queue *cq)
+int otx2_refill_pool_ptrs(void *dev, struct otx2_cq_queue *cq)
 {
 	struct otx2_nic *pfvf = dev;
+	int cnt = cq->pool_ptrs;
 	dma_addr_t bufptr;
 
 	while (cq->pool_ptrs) {
@@ -436,6 +436,8 @@ void otx2_refill_pool_ptrs(void *dev, struct otx2_cq_queue *cq)
 		otx2_aura_freeptr(pfvf, cq->cq_idx, bufptr + OTX2_HEAD_ROOM);
 		cq->pool_ptrs--;
 	}
+
+	return cnt - cq->pool_ptrs;
 }
 
 static int otx2_tx_napi_handler(struct otx2_nic *pfvf,
@@ -464,12 +466,13 @@ process_cqe:
 			break;
 		}
 
-		if (cq->cq_type == CQ_XDP) {
+		qidx = cq->cq_idx - pfvf->hw.rx_queues;
+
+		if (cq->cq_type == CQ_XDP)
 			otx2_xdp_snd_pkt_handler(pfvf, sq, cqe);
-		} else {
-			otx2_snd_pkt_handler(pfvf, cq, sq, cqe, budget,
-					     &tx_pkts, &tx_bytes);
-		}
+		else
+			otx2_snd_pkt_handler(pfvf, cq, &pfvf->qset.sq[qidx],
+					     cqe, budget, &tx_pkts, &tx_bytes);
 
 		cqe->hdr.cqe_type = NIX_XQE_TYPE_INVALID;
 		processed_cqe++;
@@ -486,7 +489,11 @@ process_cqe:
 	if (likely(tx_pkts)) {
 		struct netdev_queue *txq;
 
-		txq = netdev_get_tx_queue(pfvf->netdev, cq->cint_idx);
+		qidx = cq->cq_idx - pfvf->hw.rx_queues;
+
+		if (qidx >= pfvf->hw.tx_queues)
+			qidx -= pfvf->hw.xdp_queues;
+		txq = netdev_get_tx_queue(pfvf->netdev, qidx);
 		netdev_tx_completed_queue(txq, tx_pkts, tx_bytes);
 		/* Check if queue was stopped earlier due to ring full */
 		smp_mb();
@@ -517,6 +524,7 @@ int otx2_napi_handler(struct napi_struct *napi, int budget)
 	struct otx2_cq_queue *cq;
 	struct otx2_qset *qset;
 	struct otx2_nic *pfvf;
+	int filled_cnt = -1;
 
 	cq_poll = container_of(napi, struct otx2_cq_poll, napi);
 	pfvf = (struct otx2_nic *)cq_poll->dev;
@@ -537,7 +545,7 @@ int otx2_napi_handler(struct napi_struct *napi, int budget)
 	}
 
 	if (rx_cq && rx_cq->pool_ptrs)
-		pfvf->hw_ops->refill_pool_ptrs(pfvf, rx_cq);
+		filled_cnt = pfvf->hw_ops->refill_pool_ptrs(pfvf, rx_cq);
 	/* Clear the IRQ */
 	otx2_write64(pfvf, NIX_LF_CINTX_INT(cq_poll->cint_idx), BIT_ULL(0));
 
@@ -557,9 +565,25 @@ int otx2_napi_handler(struct napi_struct *napi, int budget)
 				otx2_config_irq_coalescing(pfvf, i);
 		}
 
-		/* Re-enable interrupts */
-		otx2_write64(pfvf, NIX_LF_CINTX_ENA_W1S(cq_poll->cint_idx),
-			     BIT_ULL(0));
+		if (unlikely(!filled_cnt)) {
+			struct refill_work *work;
+			struct delayed_work *dwork;
+
+			work = &pfvf->refill_wrk[cq->cq_idx];
+			dwork = &work->pool_refill_work;
+			/* Schedule a task if no other task is running */
+			if (!cq->refill_task_sched) {
+				work->napi = napi;
+				cq->refill_task_sched = true;
+				schedule_delayed_work(dwork,
+						      msecs_to_jiffies(100));
+			}
+		} else {
+			/* Re-enable interrupts */
+			otx2_write64(pfvf,
+				     NIX_LF_CINTX_ENA_W1S(cq_poll->cint_idx),
+				     BIT_ULL(0));
+		}
 	}
 	return workdone;
 }
@@ -734,7 +758,8 @@ static void otx2_sqe_add_hdr(struct otx2_nic *pfvf, struct otx2_snd_queue *sq,
 		sqe_hdr->aura = sq->aura_id;
 		/* Post a CQE Tx after pkt transmission */
 		sqe_hdr->pnc = 1;
-		sqe_hdr->sq = qidx;
+		sqe_hdr->sq = (qidx >=  pfvf->hw.tx_queues) ?
+			       qidx + pfvf->hw.xdp_queues : qidx;
 	}
 	sqe_hdr->total = skb->len;
 	/* Set SQE identifier which will be used later for freeing SKB */
@@ -1178,17 +1203,22 @@ bool otx2_sq_append_skb(struct net_device *netdev, struct otx2_snd_queue *sq,
 }
 EXPORT_SYMBOL(otx2_sq_append_skb);
 
-void otx2_cleanup_rx_cqes(struct otx2_nic *pfvf, struct otx2_cq_queue *cq)
+void otx2_cleanup_rx_cqes(struct otx2_nic *pfvf, struct otx2_cq_queue *cq, int qidx)
 {
 	struct nix_cqe_rx_s *cqe;
+	struct otx2_pool *pool;
 	int processed_cqe = 0;
-	u64 iova, pa;
+	u16 pool_id;
+	u64 iova;
 
 	if (pfvf->xdp_prog)
 		xdp_rxq_info_unreg(&cq->xdp_rxq);
 
 	if (otx2_nix_cq_op_status(pfvf, cq) || !cq->pend_cqe)
 		return;
+
+	pool_id = otx2_get_pool_idx(pfvf, AURA_NIX_RQ, qidx);
+	pool = &pfvf->qset.pool[pool_id];
 
 	while (cq->pend_cqe) {
 		cqe = (struct nix_cqe_rx_s *)otx2_get_next_cqe(cq);
@@ -1202,9 +1232,8 @@ void otx2_cleanup_rx_cqes(struct otx2_nic *pfvf, struct otx2_cq_queue *cq)
 			continue;
 		}
 		iova = cqe->sg.seg_addr - OTX2_HEAD_ROOM;
-		pa = otx2_iova_to_phys(pfvf->iommu_domain, iova);
-		otx2_dma_unmap_page(pfvf, iova, pfvf->rbsize, DMA_FROM_DEVICE);
-		put_page(virt_to_page(phys_to_virt(pa)));
+
+		otx2_free_bufs(pfvf, pool, iova, pfvf->rbsize);
 	}
 
 	/* Free CQEs to HW */
@@ -1219,8 +1248,10 @@ void otx2_cleanup_tx_cqes(struct otx2_nic *pfvf, struct otx2_cq_queue *cq)
 	struct nix_cqe_tx_s *cqe;
 	int processed_cqe = 0;
 	struct sg_list *sg;
+	int qidx;
 
-	sq = &pfvf->qset.sq[cq->cint_idx];
+	qidx = cq->cq_idx - pfvf->hw.rx_queues;
+	sq = &pfvf->qset.sq[qidx];
 
 	if (otx2_nix_cq_op_status(pfvf, cq) || !cq->pend_cqe)
 		return;

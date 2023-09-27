@@ -57,6 +57,7 @@
 #include <linux/mm.h>
 #include <linux/socket.h>
 #include <linux/file.h>
+#include <linux/splice.h>
 #include <linux/net.h>
 #include <linux/interrupt.h>
 #include <linux/thread_info.h>
@@ -126,11 +127,10 @@ static long compat_sock_ioctl(struct file *file,
 			      unsigned int cmd, unsigned long arg);
 #endif
 static int sock_fasync(int fd, struct file *filp, int on);
-static ssize_t sock_sendpage(struct file *file, struct page *page,
-			     int offset, size_t size, loff_t *ppos, int more);
 static ssize_t sock_splice_read(struct file *file, loff_t *ppos,
 				struct pipe_inode_info *pipe, size_t len,
 				unsigned int flags);
+static void sock_splice_eof(struct file *file);
 
 #ifdef CONFIG_PROC_FS
 static void sock_show_fdinfo(struct seq_file *m, struct file *f)
@@ -162,9 +162,9 @@ static const struct file_operations socket_file_ops = {
 	.mmap =		sock_mmap,
 	.release =	sock_close,
 	.fasync =	sock_fasync,
-	.sendpage =	sock_sendpage,
-	.splice_write = generic_splice_sendpage,
+	.splice_write = splice_to_socket,
 	.splice_read =	sock_splice_read,
+	.splice_eof =	sock_splice_eof,
 	.show_fdinfo =	sock_show_fdinfo,
 };
 
@@ -471,6 +471,7 @@ struct file *sock_alloc_file(struct socket *sock, int flags, const char *dname)
 		return file;
 	}
 
+	file->f_mode |= FMODE_NOWAIT;
 	sock->file = file;
 	file->private_data = sock;
 	stream_open(SOCK_INODE(sock), file);
@@ -820,7 +821,7 @@ static bool skb_is_swtx_tstamp(const struct sk_buff *skb, int false_tstamp)
 
 static ktime_t get_timestamp(struct sock *sk, struct sk_buff *skb, int *if_index)
 {
-	bool cycles = sk->sk_tsflags & SOF_TIMESTAMPING_BIND_PHC;
+	bool cycles = READ_ONCE(sk->sk_tsflags) & SOF_TIMESTAMPING_BIND_PHC;
 	struct skb_shared_hwtstamps *shhwtstamps = skb_hwtstamps(skb);
 	struct net_device *orig_dev;
 	ktime_t hwtstamp;
@@ -872,12 +873,12 @@ void __sock_recv_timestamp(struct msghdr *msg, struct sock *sk,
 	int need_software_tstamp = sock_flag(sk, SOCK_RCVTSTAMP);
 	int new_tstamp = sock_flag(sk, SOCK_TSTAMP_NEW);
 	struct scm_timestamping_internal tss;
-
 	int empty = 1, false_tstamp = 0;
 	struct skb_shared_hwtstamps *shhwtstamps =
 		skb_hwtstamps(skb);
 	int if_index;
 	ktime_t hwtstamp;
+	u32 tsflags;
 
 	/* Race occurred between timestamp enabling and packet
 	   receiving.  Fill in the current time for now. */
@@ -919,11 +920,12 @@ void __sock_recv_timestamp(struct msghdr *msg, struct sock *sk,
 	}
 
 	memset(&tss, 0, sizeof(tss));
-	if ((sk->sk_tsflags & SOF_TIMESTAMPING_SOFTWARE) &&
+	tsflags = READ_ONCE(sk->sk_tsflags);
+	if ((tsflags & SOF_TIMESTAMPING_SOFTWARE) &&
 	    ktime_to_timespec64_cond(skb->tstamp, tss.ts + 0))
 		empty = 0;
 	if (shhwtstamps &&
-	    (sk->sk_tsflags & SOF_TIMESTAMPING_RAW_HARDWARE) &&
+	    (tsflags & SOF_TIMESTAMPING_RAW_HARDWARE) &&
 	    !skb_is_swtx_tstamp(skb, false_tstamp)) {
 		if_index = 0;
 		if (skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP_NETDEV)
@@ -931,14 +933,14 @@ void __sock_recv_timestamp(struct msghdr *msg, struct sock *sk,
 		else
 			hwtstamp = shhwtstamps->hwtstamp;
 
-		if (sk->sk_tsflags & SOF_TIMESTAMPING_BIND_PHC)
+		if (tsflags & SOF_TIMESTAMPING_BIND_PHC)
 			hwtstamp = ptp_convert_timestamp(&hwtstamp,
-							 sk->sk_bind_phc);
+							 READ_ONCE(sk->sk_bind_phc));
 
 		if (ktime_to_timespec64_cond(hwtstamp, tss.ts + 2)) {
 			empty = 0;
 
-			if ((sk->sk_tsflags & SOF_TIMESTAMPING_OPT_PKTINFO) &&
+			if ((tsflags & SOF_TIMESTAMPING_OPT_PKTINFO) &&
 			    !skb_is_err_queue(skb))
 				put_ts_pktinfo(msg, skb, if_index);
 		}
@@ -1066,26 +1068,6 @@ int kernel_recvmsg(struct socket *sock, struct msghdr *msg,
 }
 EXPORT_SYMBOL(kernel_recvmsg);
 
-static ssize_t sock_sendpage(struct file *file, struct page *page,
-			     int offset, size_t size, loff_t *ppos, int more)
-{
-	struct socket *sock;
-	int flags;
-	int ret;
-
-	sock = file->private_data;
-
-	flags = (file->f_flags & O_NONBLOCK) ? MSG_DONTWAIT : 0;
-	/* more is a combination of MSG_MORE and MSG_SENDPAGE_NOTLAST */
-	flags |= more;
-
-	ret = kernel_sendpage(sock, page, offset, size, flags);
-
-	if (trace_sock_send_length_enabled())
-		call_trace_sock_send_length(sock->sk, ret, 0);
-	return ret;
-}
-
 static ssize_t sock_splice_read(struct file *file, loff_t *ppos,
 				struct pipe_inode_info *pipe, size_t len,
 				unsigned int flags)
@@ -1093,9 +1075,17 @@ static ssize_t sock_splice_read(struct file *file, loff_t *ppos,
 	struct socket *sock = file->private_data;
 
 	if (unlikely(!sock->ops->splice_read))
-		return generic_file_splice_read(file, ppos, pipe, len, flags);
+		return copy_splice_read(file, ppos, pipe, len, flags);
 
 	return sock->ops->splice_read(sock, ppos, pipe, len, flags);
+}
+
+static void sock_splice_eof(struct file *file)
+{
+	struct socket *sock = file->private_data;
+
+	if (sock->ops->splice_eof)
+		sock->ops->splice_eof(sock);
 }
 
 static ssize_t sock_read_iter(struct kiocb *iocb, struct iov_iter *to)
@@ -2138,6 +2128,7 @@ int __sys_sendto(int fd, void __user *buff, size_t len, unsigned int flags,
 		msg.msg_name = (struct sockaddr *)&address;
 		msg.msg_namelen = addr_len;
 	}
+	flags &= ~MSG_INTERNAL_SENDMSG_FLAGS;
 	if (sock->file->f_flags & O_NONBLOCK)
 		flags |= MSG_DONTWAIT;
 	msg.msg_flags = flags;
@@ -2483,6 +2474,7 @@ static int ____sys_sendmsg(struct socket *sock, struct msghdr *msg_sys,
 		msg_sys->msg_control = ctl_buf;
 		msg_sys->msg_control_is_user = false;
 	}
+	flags &= ~MSG_INTERNAL_SENDMSG_FLAGS;
 	msg_sys->msg_flags = flags;
 
 	if (sock->file->f_flags & O_NONBLOCK)
@@ -3528,7 +3520,11 @@ EXPORT_SYMBOL(kernel_accept);
 int kernel_connect(struct socket *sock, struct sockaddr *addr, int addrlen,
 		   int flags)
 {
-	return sock->ops->connect(sock, addr, addrlen, flags);
+	struct sockaddr_storage address;
+
+	memcpy(&address, addr, addrlen);
+
+	return sock->ops->connect(sock, (struct sockaddr *)&address, addrlen, flags);
 }
 EXPORT_SYMBOL(kernel_connect);
 
@@ -3561,54 +3557,6 @@ int kernel_getpeername(struct socket *sock, struct sockaddr *addr)
 	return sock->ops->getname(sock, addr, 1);
 }
 EXPORT_SYMBOL(kernel_getpeername);
-
-/**
- *	kernel_sendpage - send a &page through a socket (kernel space)
- *	@sock: socket
- *	@page: page
- *	@offset: page offset
- *	@size: total size in bytes
- *	@flags: flags (MSG_DONTWAIT, ...)
- *
- *	Returns the total amount sent in bytes or an error.
- */
-
-int kernel_sendpage(struct socket *sock, struct page *page, int offset,
-		    size_t size, int flags)
-{
-	if (sock->ops->sendpage) {
-		/* Warn in case the improper page to zero-copy send */
-		WARN_ONCE(!sendpage_ok(page), "improper page for zero-copy send");
-		return sock->ops->sendpage(sock, page, offset, size, flags);
-	}
-	return sock_no_sendpage(sock, page, offset, size, flags);
-}
-EXPORT_SYMBOL(kernel_sendpage);
-
-/**
- *	kernel_sendpage_locked - send a &page through the locked sock (kernel space)
- *	@sk: sock
- *	@page: page
- *	@offset: page offset
- *	@size: total size in bytes
- *	@flags: flags (MSG_DONTWAIT, ...)
- *
- *	Returns the total amount sent in bytes or an error.
- *	Caller must hold @sk.
- */
-
-int kernel_sendpage_locked(struct sock *sk, struct page *page, int offset,
-			   size_t size, int flags)
-{
-	struct socket *sock = sk->sk_socket;
-
-	if (sock->ops->sendpage_locked)
-		return sock->ops->sendpage_locked(sk, page, offset, size,
-						  flags);
-
-	return sock_no_sendpage_locked(sk, page, offset, size, flags);
-}
-EXPORT_SYMBOL(kernel_sendpage_locked);
 
 /**
  *	kernel_sock_shutdown - shut down part of a full-duplex connection (kernel space)

@@ -295,6 +295,8 @@ struct perf_event_pmu_context;
 
 struct perf_output_handle;
 
+#define PMU_NULL_DEV	((void *)(~0UL))
+
 /**
  * struct pmu - generic performance monitoring unit
  */
@@ -303,6 +305,7 @@ struct pmu {
 
 	struct module			*module;
 	struct device			*dev;
+	struct device			*parent;
 	const struct attribute_group	**attr_groups;
 	const struct attribute_group	**attr_update;
 	const char			*name;
@@ -827,6 +830,14 @@ struct perf_event {
 	void *security;
 #endif
 	struct list_head		sb_list;
+
+	/*
+	 * Certain events gets forwarded to another pmu internally by over-
+	 * writing kernel copy of event->attr.type without user being aware
+	 * of it. event->orig_type contains original 'type' requested by
+	 * user.
+	 */
+	__u32				orig_type;
 #endif /* CONFIG_PERF_EVENTS */
 };
 
@@ -1305,14 +1316,30 @@ extern int perf_event_output(struct perf_event *event,
 			     struct pt_regs *regs);
 
 static inline bool
-is_default_overflow_handler(struct perf_event *event)
+__is_default_overflow_handler(perf_overflow_handler_t overflow_handler)
 {
-	if (likely(event->overflow_handler == perf_event_output_forward))
+	if (likely(overflow_handler == perf_event_output_forward))
 		return true;
-	if (unlikely(event->overflow_handler == perf_event_output_backward))
+	if (unlikely(overflow_handler == perf_event_output_backward))
 		return true;
 	return false;
 }
+
+#define is_default_overflow_handler(event) \
+	__is_default_overflow_handler((event)->overflow_handler)
+
+#ifdef CONFIG_BPF_SYSCALL
+static inline bool uses_default_overflow_handler(struct perf_event *event)
+{
+	if (likely(is_default_overflow_handler(event)))
+		return true;
+
+	return __is_default_overflow_handler(event->orig_overflow_handler);
+}
+#else
+#define uses_default_overflow_handler(event) \
+	is_default_overflow_handler(event)
+#endif
 
 extern void
 perf_event_header__init_id(struct perf_event_header *header,

@@ -1045,6 +1045,8 @@ static int ci_hdrc_probe(struct platform_device *pdev)
 		CI_HDRC_IMX28_WRITE_FIX);
 	ci->supports_runtime_pm = !!(ci->platdata->flags &
 		CI_HDRC_SUPPORTS_RUNTIME_PM);
+	ci->has_portsc_pec_bug = !!(ci->platdata->flags &
+		CI_HDRC_HAS_PORTSC_PEC_MISSED);
 	platform_set_drvdata(pdev, ci);
 
 	ret = hw_device_init(ci, base);
@@ -1227,7 +1229,7 @@ ulpi_exit:
 	return ret;
 }
 
-static int ci_hdrc_remove(struct platform_device *pdev)
+static void ci_hdrc_remove(struct platform_device *pdev)
 {
 	struct ci_hdrc *ci = platform_get_drvdata(pdev);
 
@@ -1245,8 +1247,6 @@ static int ci_hdrc_remove(struct platform_device *pdev)
 	ci_hdrc_enter_lpm(ci, true);
 	ci_usb_phy_exit(ci);
 	ci_ulpi_exit(ci);
-
-	return 0;
 }
 
 #ifdef CONFIG_PM
@@ -1485,7 +1485,7 @@ static const struct dev_pm_ops ci_pm_ops = {
 
 static struct platform_driver ci_hdrc_driver = {
 	.probe	= ci_hdrc_probe,
-	.remove	= ci_hdrc_remove,
+	.remove_new = ci_hdrc_remove,
 	.driver	= {
 		.name	= "ci_hdrc",
 		.pm	= &ci_pm_ops,

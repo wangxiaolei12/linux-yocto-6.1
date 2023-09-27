@@ -43,9 +43,20 @@ struct scrub_ctx;
 /*
  * The following value only influences the performance.
  *
- * This determines the batch size for stripe submitted in one go.
+ * This detemines how many stripes would be submitted in one go,
+ * which is 512KiB (BTRFS_STRIPE_LEN * SCRUB_STRIPES_PER_GROUP).
  */
-#define SCRUB_STRIPES_PER_SCTX	8	/* That would be 8 64K stripe per-device. */
+#define SCRUB_STRIPES_PER_GROUP		8
+
+/*
+ * How many groups we have for each sctx.
+ *
+ * This would be 8M per device, the same value as the old scrub in-flight bios
+ * size limit.
+ */
+#define SCRUB_GROUPS_PER_SCTX		16
+
+#define SCRUB_TOTAL_STRIPES		(SCRUB_GROUPS_PER_SCTX * SCRUB_STRIPES_PER_GROUP)
 
 /*
  * The following value times PAGE_SIZE needs to be large enough to match the
@@ -172,12 +183,13 @@ struct scrub_stripe {
 };
 
 struct scrub_ctx {
-	struct scrub_stripe	stripes[SCRUB_STRIPES_PER_SCTX];
+	struct scrub_stripe	stripes[SCRUB_TOTAL_STRIPES];
 	struct scrub_stripe	*raid56_data_stripes;
 	struct btrfs_fs_info	*fs_info;
+	struct btrfs_path	extent_path;
+	struct btrfs_path	csum_path;
 	int			first_free;
 	int			cur_stripe;
-	struct list_head	csum_list;
 	atomic_t		cancel_req;
 	int			readonly;
 	int			sectors_per_bio;
@@ -309,17 +321,6 @@ static void scrub_blocked_if_needed(struct btrfs_fs_info *fs_info)
 	scrub_pause_off(fs_info);
 }
 
-static void scrub_free_csums(struct scrub_ctx *sctx)
-{
-	while (!list_empty(&sctx->csum_list)) {
-		struct btrfs_ordered_sum *sum;
-		sum = list_first_entry(&sctx->csum_list,
-				       struct btrfs_ordered_sum, list);
-		list_del(&sum->list);
-		kfree(sum);
-	}
-}
-
 static noinline_for_stack void scrub_free_ctx(struct scrub_ctx *sctx)
 {
 	int i;
@@ -327,11 +328,10 @@ static noinline_for_stack void scrub_free_ctx(struct scrub_ctx *sctx)
 	if (!sctx)
 		return;
 
-	for (i = 0; i < SCRUB_STRIPES_PER_SCTX; i++)
+	for (i = 0; i < SCRUB_TOTAL_STRIPES; i++)
 		release_scrub_stripe(&sctx->stripes[i]);
 
-	scrub_free_csums(sctx);
-	kfree(sctx);
+	kvfree(sctx);
 }
 
 static void scrub_put_ctx(struct scrub_ctx *sctx)
@@ -346,14 +346,20 @@ static noinline_for_stack struct scrub_ctx *scrub_setup_ctx(
 	struct scrub_ctx *sctx;
 	int		i;
 
-	sctx = kzalloc(sizeof(*sctx), GFP_KERNEL);
+	/* Since sctx has inline 128 stripes, it can go beyond 64K easily.  Use
+	 * kvzalloc().
+	 */
+	sctx = kvzalloc(sizeof(*sctx), GFP_KERNEL);
 	if (!sctx)
 		goto nomem;
 	refcount_set(&sctx->refs, 1);
 	sctx->is_dev_replace = is_dev_replace;
 	sctx->fs_info = fs_info;
-	INIT_LIST_HEAD(&sctx->csum_list);
-	for (i = 0; i < SCRUB_STRIPES_PER_SCTX; i++) {
+	sctx->extent_path.search_commit_root = 1;
+	sctx->extent_path.skip_locking = 1;
+	sctx->csum_path.search_commit_root = 1;
+	sctx->csum_path.skip_locking = 1;
+	for (i = 0; i < SCRUB_TOTAL_STRIPES; i++) {
 		int ret;
 
 		ret = init_scrub_stripe(fs_info, &sctx->stripes[i]);
@@ -479,11 +485,8 @@ static void scrub_print_common_warning(const char *errstr, struct btrfs_device *
 	struct extent_buffer *eb;
 	struct btrfs_extent_item *ei;
 	struct scrub_warning swarn;
-	unsigned long ptr = 0;
 	u64 flags = 0;
-	u64 ref_root;
 	u32 item_size;
-	u8 ref_level = 0;
 	int ret;
 
 	/* Super block error, no need to search extent tree. */
@@ -513,19 +516,28 @@ static void scrub_print_common_warning(const char *errstr, struct btrfs_device *
 	item_size = btrfs_item_size(eb, path->slots[0]);
 
 	if (flags & BTRFS_EXTENT_FLAG_TREE_BLOCK) {
-		do {
+		unsigned long ptr = 0;
+		u8 ref_level;
+		u64 ref_root;
+
+		while (true) {
 			ret = tree_backref_for_extent(&ptr, eb, &found_key, ei,
 						      item_size, &ref_root,
 						      &ref_level);
+			if (ret < 0) {
+				btrfs_warn(fs_info,
+				"failed to resolve tree backref for logical %llu: %d",
+						  swarn.logical, ret);
+				break;
+			}
+			if (ret > 0)
+				break;
 			btrfs_warn_in_rcu(fs_info,
 "%s at logical %llu on dev %s, physical %llu: metadata %s (level %d) in tree %llu",
-				errstr, swarn.logical,
-				btrfs_dev_name(dev),
-				swarn.physical,
-				ref_level ? "node" : "leaf",
-				ret < 0 ? -1 : ref_level,
-				ret < 0 ? -1 : ref_root);
-		} while (ret != 1);
+				errstr, swarn.logical, btrfs_dev_name(dev),
+				swarn.physical, (ref_level ? "node" : "leaf"),
+				ref_level, ref_root);
+		}
 		btrfs_release_path(path);
 	} else {
 		struct btrfs_backref_walk_ctx ctx = { 0 };
@@ -544,48 +556,6 @@ static void scrub_print_common_warning(const char *errstr, struct btrfs_device *
 
 out:
 	btrfs_free_path(path);
-}
-
-static inline int scrub_nr_raid_mirrors(struct btrfs_io_context *bioc)
-{
-	if (bioc->map_type & BTRFS_BLOCK_GROUP_RAID5)
-		return 2;
-	else if (bioc->map_type & BTRFS_BLOCK_GROUP_RAID6)
-		return 3;
-	else
-		return (int)bioc->num_stripes;
-}
-
-static inline void scrub_stripe_index_and_offset(u64 logical, u64 map_type,
-						 u64 full_stripe_logical,
-						 int nstripes, int mirror,
-						 int *stripe_index,
-						 u64 *stripe_offset)
-{
-	int i;
-
-	if (map_type & BTRFS_BLOCK_GROUP_RAID56_MASK) {
-		const int nr_data_stripes = (map_type & BTRFS_BLOCK_GROUP_RAID5) ?
-					    nstripes - 1 : nstripes - 2;
-
-		/* RAID5/6 */
-		for (i = 0; i < nr_data_stripes; i++) {
-			const u64 data_stripe_start = full_stripe_logical +
-						(i * BTRFS_STRIPE_LEN);
-
-			if (logical >= data_stripe_start &&
-			    logical < data_stripe_start + BTRFS_STRIPE_LEN)
-				break;
-		}
-
-		*stripe_index = i;
-		*stripe_offset = (logical - full_stripe_logical) &
-				 BTRFS_STRIPE_LEN_MASK;
-	} else {
-		/* The other RAID type */
-		*stripe_index = mirror;
-		*stripe_offset = 0;
-	}
 }
 
 static int fill_writer_pointer_gap(struct scrub_ctx *sctx, u64 physical)
@@ -655,7 +625,8 @@ static void scrub_verify_one_metadata(struct scrub_stripe *stripe, int sector_nr
 			      btrfs_stack_header_bytenr(header), logical);
 		return;
 	}
-	if (memcmp(header->fsid, fs_info->fs_devices->fsid, BTRFS_FSID_SIZE) != 0) {
+	if (memcmp(header->fsid, fs_info->fs_devices->metadata_uuid,
+		   BTRFS_FSID_SIZE) != 0) {
 		bitmap_set(&stripe->meta_error_bitmap, sector_nr, sectors_per_tree);
 		bitmap_set(&stripe->error_bitmap, sector_nr, sectors_per_tree);
 		btrfs_warn_rl(fs_info,
@@ -924,8 +895,9 @@ static void scrub_stripe_report_errors(struct scrub_ctx *sctx,
 
 		/* For scrub, our mirror_num should always start at 1. */
 		ASSERT(stripe->mirror_num >= 1);
-		ret = btrfs_map_sblock(fs_info, BTRFS_MAP_GET_READ_MIRRORS,
-				       stripe->logical, &mapped_len, &bioc);
+		ret = btrfs_map_block(fs_info, BTRFS_MAP_GET_READ_MIRRORS,
+				      stripe->logical, &mapped_len, &bioc,
+				      NULL, NULL, 1);
 		/*
 		 * If we failed, dev will be NULL, and later detailed reports
 		 * will just be skipped.
@@ -1516,6 +1488,8 @@ static void scrub_stripe_reset_bitmaps(struct scrub_stripe *stripe)
  * Return <0 for error.
  */
 static int scrub_find_fill_first_stripe(struct btrfs_block_group *bg,
+					struct btrfs_path *extent_path,
+					struct btrfs_path *csum_path,
 					struct btrfs_device *dev, u64 physical,
 					int mirror_num, u64 logical_start,
 					u32 logical_len,
@@ -1525,7 +1499,6 @@ static int scrub_find_fill_first_stripe(struct btrfs_block_group *bg,
 	struct btrfs_root *extent_root = btrfs_extent_root(fs_info, bg->start);
 	struct btrfs_root *csum_root = btrfs_csum_root(fs_info, bg->start);
 	const u64 logical_end = logical_start + logical_len;
-	struct btrfs_path path = { 0 };
 	u64 cur_logical = logical_start;
 	u64 stripe_end;
 	u64 extent_start;
@@ -1541,14 +1514,13 @@ static int scrub_find_fill_first_stripe(struct btrfs_block_group *bg,
 	/* The range must be inside the bg. */
 	ASSERT(logical_start >= bg->start && logical_end <= bg->start + bg->length);
 
-	path.search_commit_root = 1;
-	path.skip_locking = 1;
-
-	ret = find_first_extent_item(extent_root, &path, logical_start, logical_len);
+	ret = find_first_extent_item(extent_root, extent_path, logical_start,
+				     logical_len);
 	/* Either error or not found. */
 	if (ret)
 		goto out;
-	get_extent_info(&path, &extent_start, &extent_len, &extent_flags, &extent_gen);
+	get_extent_info(extent_path, &extent_start, &extent_len, &extent_flags,
+			&extent_gen);
 	if (extent_flags & BTRFS_EXTENT_FLAG_TREE_BLOCK)
 		stripe->nr_meta_extents++;
 	if (extent_flags & BTRFS_EXTENT_FLAG_DATA)
@@ -1576,7 +1548,7 @@ static int scrub_find_fill_first_stripe(struct btrfs_block_group *bg,
 
 	/* Fill the extent info for the remaining sectors. */
 	while (cur_logical <= stripe_end) {
-		ret = find_first_extent_item(extent_root, &path, cur_logical,
+		ret = find_first_extent_item(extent_root, extent_path, cur_logical,
 					     stripe_end - cur_logical + 1);
 		if (ret < 0)
 			goto out;
@@ -1584,7 +1556,7 @@ static int scrub_find_fill_first_stripe(struct btrfs_block_group *bg,
 			ret = 0;
 			break;
 		}
-		get_extent_info(&path, &extent_start, &extent_len,
+		get_extent_info(extent_path, &extent_start, &extent_len,
 				&extent_flags, &extent_gen);
 		if (extent_flags & BTRFS_EXTENT_FLAG_TREE_BLOCK)
 			stripe->nr_meta_extents++;
@@ -1609,9 +1581,9 @@ static int scrub_find_fill_first_stripe(struct btrfs_block_group *bg,
 		 */
 		ASSERT(BITS_PER_LONG >= BTRFS_STRIPE_LEN >> fs_info->sectorsize_bits);
 
-		ret = btrfs_lookup_csums_bitmap(csum_root, stripe->logical,
-						stripe_end, stripe->csums,
-						&csum_bitmap, true);
+		ret = btrfs_lookup_csums_bitmap(csum_root, csum_path,
+						stripe->logical, stripe_end,
+						stripe->csums, &csum_bitmap);
 		if (ret < 0)
 			goto out;
 		if (ret > 0)
@@ -1624,7 +1596,6 @@ static int scrub_find_fill_first_stripe(struct btrfs_block_group *bg,
 	}
 	set_bit(SCRUB_STRIPE_FLAG_INITIALIZED, &stripe->state);
 out:
-	btrfs_release_path(&path);
 	return ret;
 }
 
@@ -1702,6 +1673,28 @@ static bool stripe_has_metadata_error(struct scrub_stripe *stripe)
 	return false;
 }
 
+static void submit_initial_group_read(struct scrub_ctx *sctx,
+				      unsigned int first_slot,
+				      unsigned int nr_stripes)
+{
+	struct blk_plug plug;
+
+	ASSERT(first_slot < SCRUB_TOTAL_STRIPES);
+	ASSERT(first_slot + nr_stripes <= SCRUB_TOTAL_STRIPES);
+
+	scrub_throttle_dev_io(sctx, sctx->stripes[0].dev,
+			      btrfs_stripe_nr_to_offset(nr_stripes));
+	blk_start_plug(&plug);
+	for (int i = 0; i < nr_stripes; i++) {
+		struct scrub_stripe *stripe = &sctx->stripes[first_slot + i];
+
+		/* Those stripes should be initialized. */
+		ASSERT(test_bit(SCRUB_STRIPE_FLAG_INITIALIZED, &stripe->state));
+		scrub_submit_initial_read(sctx, stripe);
+	}
+	blk_finish_plug(&plug);
+}
+
 static int flush_scrub_stripes(struct scrub_ctx *sctx)
 {
 	struct btrfs_fs_info *fs_info = sctx->fs_info;
@@ -1714,11 +1707,11 @@ static int flush_scrub_stripes(struct scrub_ctx *sctx)
 
 	ASSERT(test_bit(SCRUB_STRIPE_FLAG_INITIALIZED, &sctx->stripes[0].state));
 
-	scrub_throttle_dev_io(sctx, sctx->stripes[0].dev,
-			      btrfs_stripe_nr_to_offset(nr_stripes));
-	for (int i = 0; i < nr_stripes; i++) {
-		stripe = &sctx->stripes[i];
-		scrub_submit_initial_read(sctx, stripe);
+	/* Submit the stripes which are populated but not submitted. */
+	if (nr_stripes % SCRUB_STRIPES_PER_GROUP) {
+		const int first_slot = round_down(nr_stripes, SCRUB_STRIPES_PER_GROUP);
+
+		submit_initial_group_read(sctx, first_slot, nr_stripes - first_slot);
 	}
 
 	for (int i = 0; i < nr_stripes; i++) {
@@ -1798,28 +1791,40 @@ static void raid56_scrub_wait_endio(struct bio *bio)
 
 static int queue_scrub_stripe(struct scrub_ctx *sctx, struct btrfs_block_group *bg,
 			      struct btrfs_device *dev, int mirror_num,
-			      u64 logical, u32 length, u64 physical)
+			      u64 logical, u32 length, u64 physical,
+			      u64 *found_logical_ret)
 {
 	struct scrub_stripe *stripe;
 	int ret;
 
-	/* No available slot, submit all stripes and wait for them. */
-	if (sctx->cur_stripe >= SCRUB_STRIPES_PER_SCTX) {
-		ret = flush_scrub_stripes(sctx);
-		if (ret < 0)
-			return ret;
-	}
+	/*
+	 * There should always be one slot left, as caller filling the last
+	 * slot should flush them all.
+	 */
+	ASSERT(sctx->cur_stripe < SCRUB_TOTAL_STRIPES);
 
 	stripe = &sctx->stripes[sctx->cur_stripe];
-
-	/* We can queue one stripe using the remaining slot. */
 	scrub_reset_stripe(stripe);
-	ret = scrub_find_fill_first_stripe(bg, dev, physical, mirror_num,
-					   logical, length, stripe);
+	ret = scrub_find_fill_first_stripe(bg, &sctx->extent_path,
+					   &sctx->csum_path, dev, physical,
+					   mirror_num, logical, length, stripe);
 	/* Either >0 as no more extents or <0 for error. */
 	if (ret)
 		return ret;
+	if (found_logical_ret)
+		*found_logical_ret = stripe->logical;
 	sctx->cur_stripe++;
+
+	/* We filled one group, submit it. */
+	if (sctx->cur_stripe % SCRUB_STRIPES_PER_GROUP == 0) {
+		const int first_slot = sctx->cur_stripe - SCRUB_STRIPES_PER_GROUP;
+
+		submit_initial_group_read(sctx, first_slot, SCRUB_STRIPES_PER_GROUP);
+	}
+
+	/* Last slot used, flush them all. */
+	if (sctx->cur_stripe == SCRUB_TOTAL_STRIPES)
+		return flush_scrub_stripes(sctx);
 	return 0;
 }
 
@@ -1833,6 +1838,8 @@ static int scrub_raid56_parity_stripe(struct scrub_ctx *sctx,
 	struct btrfs_fs_info *fs_info = sctx->fs_info;
 	struct btrfs_raid_bio *rbio;
 	struct btrfs_io_context *bioc = NULL;
+	struct btrfs_path extent_path = { 0 };
+	struct btrfs_path csum_path = { 0 };
 	struct bio *bio;
 	struct scrub_stripe *stripe;
 	bool all_empty = true;
@@ -1842,6 +1849,16 @@ static int scrub_raid56_parity_stripe(struct scrub_ctx *sctx,
 	int ret;
 
 	ASSERT(sctx->raid56_data_stripes);
+
+	/*
+	 * For data stripe search, we cannot re-use the same extent/csum paths,
+	 * as the data stripe bytenr may be smaller than previous extent.  Thus
+	 * we have to use our own extent/csum paths.
+	 */
+	extent_path.search_commit_root = 1;
+	extent_path.skip_locking = 1;
+	csum_path.search_commit_root = 1;
+	csum_path.skip_locking = 1;
 
 	for (int i = 0; i < data_stripes; i++) {
 		int stripe_index;
@@ -1857,7 +1874,7 @@ static int scrub_raid56_parity_stripe(struct scrub_ctx *sctx,
 
 		scrub_reset_stripe(stripe);
 		set_bit(SCRUB_STRIPE_FLAG_NO_REPORT, &stripe->state);
-		ret = scrub_find_fill_first_stripe(bg,
+		ret = scrub_find_fill_first_stripe(bg, &extent_path, &csum_path,
 				map->stripes[stripe_index].dev, physical, 1,
 				full_stripe_start + btrfs_stripe_nr_to_offset(i),
 				BTRFS_STRIPE_LEN, stripe);
@@ -1957,8 +1974,8 @@ static int scrub_raid56_parity_stripe(struct scrub_ctx *sctx,
 	bio->bi_end_io = raid56_scrub_wait_endio;
 
 	btrfs_bio_counter_inc_blocked(fs_info);
-	ret = btrfs_map_sblock(fs_info, BTRFS_MAP_WRITE, full_stripe_start,
-			       &length, &bioc);
+	ret = btrfs_map_block(fs_info, BTRFS_MAP_WRITE, full_stripe_start,
+			      &length, &bioc, NULL, NULL, 1);
 	if (ret < 0) {
 		btrfs_put_bioc(bioc);
 		btrfs_bio_counter_dec(fs_info);
@@ -1972,12 +1989,21 @@ static int scrub_raid56_parity_stripe(struct scrub_ctx *sctx,
 		btrfs_bio_counter_dec(fs_info);
 		goto out;
 	}
+	/* Use the recovered stripes as cache to avoid read them from disk again. */
+	for (int i = 0; i < data_stripes; i++) {
+		stripe = &sctx->raid56_data_stripes[i];
+
+		raid56_parity_cache_data_pages(rbio, stripe->pages,
+				full_stripe_start + (i << BTRFS_STRIPE_LEN_SHIFT));
+	}
 	raid56_parity_submit_scrub_rbio(rbio);
 	wait_for_completion_io(&io_done);
 	ret = blk_status_to_errno(bio->bi_status);
 	bio_put(bio);
 	btrfs_bio_counter_dec(fs_info);
 
+	btrfs_release_path(&extent_path);
+	btrfs_release_path(&csum_path);
 out:
 	return ret;
 }
@@ -2011,6 +2037,7 @@ static int scrub_simple_mirror(struct scrub_ctx *sctx,
 	path.skip_locking = 1;
 	/* Go through each extent items inside the logical range */
 	while (cur_logical < logical_end) {
+		u64 found_logical;
 		u64 cur_physical = physical + cur_logical - logical_start;
 
 		/* Canceled? */
@@ -2035,7 +2062,7 @@ static int scrub_simple_mirror(struct scrub_ctx *sctx,
 
 		ret = queue_scrub_stripe(sctx, bg, device, mirror_num,
 					 cur_logical, logical_end - cur_logical,
-					 cur_physical);
+					 cur_physical, &found_logical);
 		if (ret > 0) {
 			/* No more extent, just update the accounting */
 			sctx->stat.last_physical = physical + logical_length;
@@ -2045,9 +2072,7 @@ static int scrub_simple_mirror(struct scrub_ctx *sctx,
 		if (ret < 0)
 			break;
 
-		ASSERT(sctx->cur_stripe > 0);
-		cur_logical = sctx->stripes[sctx->cur_stripe - 1].logical
-			      + BTRFS_STRIPE_LEN;
+		cur_logical = found_logical + BTRFS_STRIPE_LEN;
 
 		/* Don't hold CPU for too long time */
 		cond_resched();
@@ -2149,6 +2174,9 @@ static noinline_for_stack int scrub_stripe(struct scrub_ctx *sctx,
 	u64 offset;
 	u64 stripe_logical;
 	int stop_loop = 0;
+
+	/* Extent_path should be released by now. */
+	ASSERT(sctx->extent_path.nodes[0] == NULL);
 
 	scrub_blocked_if_needed(fs_info);
 
@@ -2268,6 +2296,9 @@ out:
 	ret2 = flush_scrub_stripes(sctx);
 	if (!ret)
 		ret = ret2;
+	btrfs_release_path(&sctx->extent_path);
+	btrfs_release_path(&sctx->csum_path);
+
 	if (sctx->raid56_data_stripes) {
 		for (int i = 0; i < nr_data_stripes(map); i++)
 			release_scrub_stripe(&sctx->raid56_data_stripes[i]);
@@ -2740,17 +2771,12 @@ static void scrub_workers_put(struct btrfs_fs_info *fs_info)
 	if (refcount_dec_and_mutex_lock(&fs_info->scrub_workers_refcnt,
 					&fs_info->scrub_lock)) {
 		struct workqueue_struct *scrub_workers = fs_info->scrub_workers;
-		struct workqueue_struct *scrub_wr_comp =
-						fs_info->scrub_wr_completion_workers;
 
 		fs_info->scrub_workers = NULL;
-		fs_info->scrub_wr_completion_workers = NULL;
 		mutex_unlock(&fs_info->scrub_lock);
 
 		if (scrub_workers)
 			destroy_workqueue(scrub_workers);
-		if (scrub_wr_comp)
-			destroy_workqueue(scrub_wr_comp);
 	}
 }
 
@@ -2761,7 +2787,6 @@ static noinline_for_stack int scrub_workers_get(struct btrfs_fs_info *fs_info,
 						int is_dev_replace)
 {
 	struct workqueue_struct *scrub_workers = NULL;
-	struct workqueue_struct *scrub_wr_comp = NULL;
 	unsigned int flags = WQ_FREEZABLE | WQ_UNBOUND;
 	int max_active = fs_info->thread_pool_size;
 	int ret = -ENOMEM;
@@ -2769,21 +2794,17 @@ static noinline_for_stack int scrub_workers_get(struct btrfs_fs_info *fs_info,
 	if (refcount_inc_not_zero(&fs_info->scrub_workers_refcnt))
 		return 0;
 
-	scrub_workers = alloc_workqueue("btrfs-scrub", flags,
-					is_dev_replace ? 1 : max_active);
+	if (is_dev_replace)
+		scrub_workers = alloc_ordered_workqueue("btrfs-scrub", flags);
+	else
+		scrub_workers = alloc_workqueue("btrfs-scrub", flags, max_active);
 	if (!scrub_workers)
-		goto fail_scrub_workers;
-
-	scrub_wr_comp = alloc_workqueue("btrfs-scrubwrc", flags, max_active);
-	if (!scrub_wr_comp)
-		goto fail_scrub_wr_completion_workers;
+		return -ENOMEM;
 
 	mutex_lock(&fs_info->scrub_lock);
 	if (refcount_read(&fs_info->scrub_workers_refcnt) == 0) {
-		ASSERT(fs_info->scrub_workers == NULL &&
-		       fs_info->scrub_wr_completion_workers == NULL);
+		ASSERT(fs_info->scrub_workers == NULL);
 		fs_info->scrub_workers = scrub_workers;
-		fs_info->scrub_wr_completion_workers = scrub_wr_comp;
 		refcount_set(&fs_info->scrub_workers_refcnt, 1);
 		mutex_unlock(&fs_info->scrub_lock);
 		return 0;
@@ -2794,10 +2815,7 @@ static noinline_for_stack int scrub_workers_get(struct btrfs_fs_info *fs_info,
 
 	ret = 0;
 
-	destroy_workqueue(scrub_wr_comp);
-fail_scrub_wr_completion_workers:
 	destroy_workqueue(scrub_workers);
-fail_scrub_workers:
 	return ret;
 }
 

@@ -75,7 +75,7 @@ struct intel_pad_context {
 	u32 padctrl1;
 };
 
-#define CHV_INVALID_HWIRQ	((unsigned int)INVALID_HWIRQ)
+#define CHV_INVALID_HWIRQ	(~0U)
 
 /**
  * struct intel_community_context - community context for Cherryview
@@ -949,11 +949,6 @@ static int chv_config_get(struct pinctrl_dev *pctldev, unsigned int pin,
 
 		break;
 
-	case PIN_CONFIG_DRIVE_OPEN_DRAIN:
-		if (!(ctrl1 & CHV_PADCTRL1_ODEN))
-			return -EINVAL;
-		break;
-
 	case PIN_CONFIG_BIAS_HIGH_IMPEDANCE: {
 		u32 cfg;
 
@@ -962,6 +957,16 @@ static int chv_config_get(struct pinctrl_dev *pctldev, unsigned int pin,
 		if (cfg != CHV_PADCTRL0_GPIOCFG_HIZ)
 			return -EINVAL;
 
+		break;
+
+	case PIN_CONFIG_DRIVE_PUSH_PULL:
+		if (ctrl1 & CHV_PADCTRL1_ODEN)
+			return -EINVAL;
+		break;
+
+	case PIN_CONFIG_DRIVE_OPEN_DRAIN:
+		if (!(ctrl1 & CHV_PADCTRL1_ODEN))
+			return -EINVAL;
 		break;
 	}
 
@@ -1408,8 +1413,10 @@ static int chv_gpio_irq_type(struct irq_data *d, unsigned int type)
 	raw_spin_lock_irqsave(&chv_lock, flags);
 
 	ret = chv_gpio_set_intr_line(pctrl, hwirq);
-	if (ret)
-		goto out_unlock;
+	if (ret) {
+		raw_spin_unlock_irqrestore(&chv_lock, flags);
+		return ret;
+	}
 
 	/*
 	 * Pins which can be used as shared interrupt are configured in
@@ -1450,10 +1457,9 @@ static int chv_gpio_irq_type(struct irq_data *d, unsigned int type)
 	else if (type & IRQ_TYPE_LEVEL_MASK)
 		irq_set_handler_locked(d, handle_level_irq);
 
-out_unlock:
 	raw_spin_unlock_irqrestore(&chv_lock, flags);
 
-	return ret;
+	return 0;
 }
 
 static const struct irq_chip chv_gpio_irq_chip = {
@@ -1695,7 +1701,6 @@ static int chv_pinctrl_probe(struct platform_device *pdev)
 	struct intel_community_context *cctx;
 	struct intel_community *community;
 	struct device *dev = &pdev->dev;
-	struct acpi_device *adev = ACPI_COMPANION(dev);
 	struct intel_pinctrl *pctrl;
 	acpi_status status;
 	unsigned int i;
@@ -1763,7 +1768,7 @@ static int chv_pinctrl_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	status = acpi_install_address_space_handler(adev->handle,
+	status = acpi_install_address_space_handler(ACPI_HANDLE(dev),
 					community->acpi_space_id,
 					chv_pinctrl_mmio_access_handler,
 					NULL, pctrl);
@@ -1780,7 +1785,7 @@ static int chv_pinctrl_remove(struct platform_device *pdev)
 	struct intel_pinctrl *pctrl = platform_get_drvdata(pdev);
 	const struct intel_community *community = &pctrl->communities[0];
 
-	acpi_remove_address_space_handler(ACPI_COMPANION(&pdev->dev),
+	acpi_remove_address_space_handler(ACPI_HANDLE(&pdev->dev),
 					  community->acpi_space_id,
 					  chv_pinctrl_mmio_access_handler);
 

@@ -42,6 +42,7 @@
 #include <net/sock.h>
 #include <net/snmp.h>
 
+#include <net/gso.h>
 #include <net/ipv6.h>
 #include <net/ndisc.h>
 #include <net/protocol.h>
@@ -112,7 +113,7 @@ static int ip6_finish_output2(struct net *net, struct sock *sk, struct sk_buff *
 	if (lwtunnel_xmit_redirect(dst->lwtstate)) {
 		int res = lwtunnel_xmit(skb);
 
-		if (res < 0 || res == LWTUNNEL_XMIT_DONE)
+		if (res != LWTUNNEL_XMIT_CONTINUE)
 			return res;
 	}
 
@@ -1501,7 +1502,7 @@ static int __ip6_append_data(struct sock *sk,
 	orig_mtu = mtu;
 
 	if (cork->tx_flags & SKBTX_ANY_TSTAMP &&
-	    sk->sk_tsflags & SOF_TIMESTAMPING_OPT_ID)
+	    READ_ONCE(sk->sk_tsflags) & SOF_TIMESTAMPING_OPT_ID)
 		tskey = atomic_inc_return(&sk->sk_tskey) - 1;
 
 	hh_len = LL_RESERVED_SPACE(rt->dst.dev);
@@ -1589,6 +1590,15 @@ emsgsize:
 				skb_zcopy_set(skb, uarg, &extra_uref);
 			}
 		}
+	} else if ((flags & MSG_SPLICE_PAGES) && length) {
+		if (inet_sk(sk)->hdrincl)
+			return -EPERM;
+		if (rt->dst.dev->features & NETIF_F_SG &&
+		    getfrag == ip_generic_getfrag)
+			/* We need an empty buffer to attach stuff to */
+			paged = true;
+		else
+			flags &= ~MSG_SPLICE_PAGES;
 	}
 
 	/*
@@ -1778,6 +1788,15 @@ alloc_new_skb:
 				err = -EFAULT;
 				goto error;
 			}
+		} else if (flags & MSG_SPLICE_PAGES) {
+			struct msghdr *msg = from;
+
+			err = skb_splice_from_iter(skb, &msg->msg_iter, copy,
+						   sk->sk_allocation);
+			if (err < 0)
+				goto error;
+			copy = err;
+			wmem_alloc_delta += copy;
 		} else if (!zc) {
 			int i = skb_shinfo(skb)->nr_frags;
 

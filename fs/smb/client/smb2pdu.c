@@ -88,9 +88,20 @@ smb2_hdr_assemble(struct smb2_hdr *shdr, __le16 smb2_cmd,
 		  const struct cifs_tcon *tcon,
 		  struct TCP_Server_Info *server)
 {
+	struct smb3_hdr_req *smb3_hdr;
 	shdr->ProtocolId = SMB2_PROTO_NUMBER;
 	shdr->StructureSize = cpu_to_le16(64);
 	shdr->Command = smb2_cmd;
+	if (server->dialect >= SMB30_PROT_ID) {
+		/* After reconnect SMB3 must set ChannelSequence on subsequent reqs */
+		smb3_hdr = (struct smb3_hdr_req *)shdr;
+		/* if primary channel is not set yet, use default channel for chan sequence num */
+		if (CIFS_SERVER_IS_CHAN(server))
+			smb3_hdr->ChannelSequence =
+				cpu_to_le16(server->primary_server->channel_sequence_num);
+		else
+			smb3_hdr->ChannelSequence = cpu_to_le16(server->channel_sequence_num);
+	}
 	if (server) {
 		spin_lock(&server->req_lock);
 		/* Request up to 10 credits but don't go over the limit. */
@@ -242,7 +253,7 @@ again:
 	}
 	spin_unlock(&server->srv_lock);
 
-	nls_codepage = load_nls_default();
+	nls_codepage = ses->local_nls;
 
 	/*
 	 * need to prevent multiple threads trying to simultaneously
@@ -324,7 +335,6 @@ out:
 		rc = -EAGAIN;
 	}
 failed:
-	unload_nls(nls_codepage);
 	return rc;
 }
 
@@ -3797,6 +3807,12 @@ void smb2_reconnect_server(struct work_struct *work)
 
 	spin_lock(&cifs_tcp_ses_lock);
 	list_for_each_entry(ses, &pserver->smb_ses_list, smb_ses_list) {
+		spin_lock(&ses->ses_lock);
+		if (ses->ses_status == SES_EXITING) {
+			spin_unlock(&ses->ses_lock);
+			continue;
+		}
+		spin_unlock(&ses->ses_lock);
 
 		tcon_selected = false;
 

@@ -27,6 +27,7 @@
 #include <linux/firmware.h>
 #include <crypto/hash.h>
 #include <linux/usb/r8152.h>
+#include <net/gso.h>
 
 /* Information for net-next */
 #define NETNEXT_VERSION		"12"
@@ -2627,6 +2628,9 @@ static int r8152_poll(struct napi_struct *napi, int budget)
 {
 	struct r8152 *tp = container_of(napi, struct r8152, napi);
 	int work_done;
+
+	if (!budget)
+		return 0;
 
 	work_done = rx_bottom(tp, budget);
 

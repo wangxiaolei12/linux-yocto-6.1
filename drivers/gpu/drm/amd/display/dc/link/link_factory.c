@@ -563,11 +563,9 @@ static bool construct_phy(struct dc_link *link,
 		goto create_fail;
 	}
 
-	/* TODO: #DAL3 Implement id to str function.*/
-	LINK_INFO("Connector[%d] description:"
-		  "signal %d\n",
+	LINK_INFO("Connector[%d] description: signal: %s\n",
 		  init_params->connector_index,
-		  link->connector_signal);
+		  signal_type_to_string(link->connector_signal));
 
 	ddc_service_init_data.ctx = link->ctx;
 	ddc_service_init_data.id = link->link_id;
@@ -784,6 +782,10 @@ static bool construct_dpia(struct dc_link *link,
 
 	/* Set dpia port index : 0 to number of dpia ports */
 	link->ddc_hw_inst = init_params->connector_index;
+
+	// Assign Dpia preferred eng_id
+	if (link->dc->res_pool->funcs->get_preferred_eng_id_dpia)
+		link->dpia_preferred_eng_id = link->dc->res_pool->funcs->get_preferred_eng_id_dpia(link->ddc_hw_inst);
 
 	/* TODO: Create link encoder */
 

@@ -28,6 +28,7 @@ static LIST_HEAD(icc_providers);
 static int providers_count;
 static bool synced_state;
 static DEFINE_MUTEX(icc_lock);
+static DEFINE_MUTEX(icc_bw_lock);
 static struct dentry *icc_debugfs_dir;
 
 static void icc_summary_show_one(struct seq_file *s, struct icc_node *n)
@@ -587,7 +588,7 @@ EXPORT_SYMBOL_GPL(icc_set_tag);
 
 /**
  * icc_get_name() - Get name of the icc path
- * @path: reference to the path returned by icc_get()
+ * @path: interconnect path
  *
  * This function is used by an interconnect consumer to get the name of the icc
  * path.
@@ -605,7 +606,7 @@ EXPORT_SYMBOL_GPL(icc_get_name);
 
 /**
  * icc_set_bw() - set bandwidth constraints on an interconnect path
- * @path: reference to the path returned by icc_get()
+ * @path: interconnect path
  * @avg_bw: average bandwidth in kilobytes per second
  * @peak_bw: peak bandwidth in kilobytes per second
  *
@@ -631,7 +632,7 @@ int icc_set_bw(struct icc_path *path, u32 avg_bw, u32 peak_bw)
 	if (WARN_ON(IS_ERR(path) || !path->num_nodes))
 		return -EINVAL;
 
-	mutex_lock(&icc_lock);
+	mutex_lock(&icc_bw_lock);
 
 	old_avg = path->reqs[0].avg_bw;
 	old_peak = path->reqs[0].peak_bw;
@@ -663,7 +664,7 @@ int icc_set_bw(struct icc_path *path, u32 avg_bw, u32 peak_bw)
 		apply_constraints(path);
 	}
 
-	mutex_unlock(&icc_lock);
+	mutex_unlock(&icc_bw_lock);
 
 	trace_icc_set_bw_end(path, ret);
 
@@ -703,54 +704,6 @@ int icc_disable(struct icc_path *path)
 	return __icc_enable(path, false);
 }
 EXPORT_SYMBOL_GPL(icc_disable);
-
-/**
- * icc_get() - return a handle for path between two endpoints
- * @dev: the device requesting the path
- * @src_id: source device port id
- * @dst_id: destination device port id
- *
- * This function will search for a path between two endpoints and return an
- * icc_path handle on success. Use icc_put() to release
- * constraints when they are not needed anymore.
- * If the interconnect API is disabled, NULL is returned and the consumer
- * drivers will still build. Drivers are free to handle this specifically,
- * but they don't have to.
- *
- * Return: icc_path pointer on success, ERR_PTR() on error or NULL if the
- * interconnect API is disabled.
- */
-struct icc_path *icc_get(struct device *dev, const int src_id, const int dst_id)
-{
-	struct icc_node *src, *dst;
-	struct icc_path *path = ERR_PTR(-EPROBE_DEFER);
-
-	mutex_lock(&icc_lock);
-
-	src = node_find(src_id);
-	if (!src)
-		goto out;
-
-	dst = node_find(dst_id);
-	if (!dst)
-		goto out;
-
-	path = path_find(dev, src, dst);
-	if (IS_ERR(path)) {
-		dev_err(dev, "%s: invalid path=%ld\n", __func__, PTR_ERR(path));
-		goto out;
-	}
-
-	path->name = kasprintf(GFP_KERNEL, "%s-%s", src->name, dst->name);
-	if (!path->name) {
-		kfree(path);
-		path = ERR_PTR(-ENOMEM);
-	}
-out:
-	mutex_unlock(&icc_lock);
-	return path;
-}
-EXPORT_SYMBOL_GPL(icc_get);
 
 /**
  * icc_put() - release the reference to the icc_path
@@ -920,6 +873,7 @@ void icc_node_add(struct icc_node *node, struct icc_provider *provider)
 		return;
 
 	mutex_lock(&icc_lock);
+	mutex_lock(&icc_bw_lock);
 
 	node->provider = provider;
 	list_add_tail(&node->node_list, &provider->nodes);
@@ -948,6 +902,7 @@ void icc_node_add(struct icc_node *node, struct icc_provider *provider)
 	node->avg_bw = 0;
 	node->peak_bw = 0;
 
+	mutex_unlock(&icc_bw_lock);
 	mutex_unlock(&icc_lock);
 }
 EXPORT_SYMBOL_GPL(icc_node_add);
@@ -1073,6 +1028,7 @@ void icc_sync_state(struct device *dev)
 		return;
 
 	mutex_lock(&icc_lock);
+	mutex_lock(&icc_bw_lock);
 	synced_state = true;
 	list_for_each_entry(p, &icc_providers, provider_list) {
 		dev_dbg(p->dev, "interconnect provider is in synced state\n");
@@ -1085,13 +1041,21 @@ void icc_sync_state(struct device *dev)
 			}
 		}
 	}
+	mutex_unlock(&icc_bw_lock);
 	mutex_unlock(&icc_lock);
 }
 EXPORT_SYMBOL_GPL(icc_sync_state);
 
 static int __init icc_init(void)
 {
-	struct device_node *root = of_find_node_by_path("/");
+	struct device_node *root;
+
+	/* Teach lockdep about lock ordering wrt. shrinker: */
+	fs_reclaim_acquire(GFP_KERNEL);
+	might_lock(&icc_bw_lock);
+	fs_reclaim_release(GFP_KERNEL);
+
+	root = of_find_node_by_path("/");
 
 	providers_count = of_count_icc_providers(root);
 	of_node_put(root);

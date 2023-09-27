@@ -2160,15 +2160,23 @@ static int hci_le_del_accept_list_sync(struct hci_dev *hdev,
 	return 0;
 }
 
+struct conn_params {
+	bdaddr_t addr;
+	u8 addr_type;
+	hci_conn_flags_t flags;
+	u8 privacy_mode;
+};
+
 /* Adds connection to resolve list if needed.
  * Setting params to NULL programs local hdev->irk
  */
 static int hci_le_add_resolve_list_sync(struct hci_dev *hdev,
-					struct hci_conn_params *params)
+					struct conn_params *params)
 {
 	struct hci_cp_le_add_to_resolv_list cp;
 	struct smp_irk *irk;
 	struct bdaddr_list_with_irk *entry;
+	struct hci_conn_params *p;
 
 	if (!use_ll_privacy(hdev))
 		return 0;
@@ -2203,6 +2211,16 @@ static int hci_le_add_resolve_list_sync(struct hci_dev *hdev,
 	/* Default privacy mode is always Network */
 	params->privacy_mode = HCI_NETWORK_PRIVACY;
 
+	rcu_read_lock();
+	p = hci_pend_le_action_lookup(&hdev->pend_le_conns,
+				      &params->addr, params->addr_type);
+	if (!p)
+		p = hci_pend_le_action_lookup(&hdev->pend_le_reports,
+					      &params->addr, params->addr_type);
+	if (p)
+		WRITE_ONCE(p->privacy_mode, HCI_NETWORK_PRIVACY);
+	rcu_read_unlock();
+
 done:
 	if (hci_dev_test_flag(hdev, HCI_PRIVACY))
 		memcpy(cp.local_irk, hdev->irk, 16);
@@ -2215,7 +2233,7 @@ done:
 
 /* Set Device Privacy Mode. */
 static int hci_le_set_privacy_mode_sync(struct hci_dev *hdev,
-					struct hci_conn_params *params)
+					struct conn_params *params)
 {
 	struct hci_cp_le_set_privacy_mode cp;
 	struct smp_irk *irk;
@@ -2240,6 +2258,8 @@ static int hci_le_set_privacy_mode_sync(struct hci_dev *hdev,
 	bacpy(&cp.bdaddr, &irk->bdaddr);
 	cp.mode = HCI_DEVICE_PRIVACY;
 
+	/* Note: params->privacy_mode is not updated since it is a copy */
+
 	return __hci_cmd_sync_status(hdev, HCI_OP_LE_SET_PRIVACY_MODE,
 				     sizeof(cp), &cp, HCI_CMD_TIMEOUT);
 }
@@ -2249,7 +2269,7 @@ static int hci_le_set_privacy_mode_sync(struct hci_dev *hdev,
  * properly set the privacy mode.
  */
 static int hci_le_add_accept_list_sync(struct hci_dev *hdev,
-				       struct hci_conn_params *params,
+				       struct conn_params *params,
 				       u8 *num_entries)
 {
 	struct hci_cp_le_add_to_accept_list cp;
@@ -2447,6 +2467,52 @@ struct sk_buff *hci_read_local_oob_data_sync(struct hci_dev *hdev,
 	return __hci_cmd_sync_sk(hdev, opcode, 0, NULL, 0, HCI_CMD_TIMEOUT, sk);
 }
 
+static struct conn_params *conn_params_copy(struct list_head *list, size_t *n)
+{
+	struct hci_conn_params *params;
+	struct conn_params *p;
+	size_t i;
+
+	rcu_read_lock();
+
+	i = 0;
+	list_for_each_entry_rcu(params, list, action)
+		++i;
+	*n = i;
+
+	rcu_read_unlock();
+
+	p = kvcalloc(*n, sizeof(struct conn_params), GFP_KERNEL);
+	if (!p)
+		return NULL;
+
+	rcu_read_lock();
+
+	i = 0;
+	list_for_each_entry_rcu(params, list, action) {
+		/* Racing adds are handled in next scan update */
+		if (i >= *n)
+			break;
+
+		/* No hdev->lock, but: addr, addr_type are immutable.
+		 * privacy_mode is only written by us or in
+		 * hci_cc_le_set_privacy_mode that we wait for.
+		 * We should be idempotent so MGMT updating flags
+		 * while we are processing is OK.
+		 */
+		bacpy(&p[i].addr, &params->addr);
+		p[i].addr_type = params->addr_type;
+		p[i].flags = READ_ONCE(params->flags);
+		p[i].privacy_mode = READ_ONCE(params->privacy_mode);
+		++i;
+	}
+
+	rcu_read_unlock();
+
+	*n = i;
+	return p;
+}
+
 /* Device must not be scanning when updating the accept list.
  *
  * Update is done using the following sequence:
@@ -2466,11 +2532,12 @@ struct sk_buff *hci_read_local_oob_data_sync(struct hci_dev *hdev,
  */
 static u8 hci_update_accept_list_sync(struct hci_dev *hdev)
 {
-	struct hci_conn_params *params;
+	struct conn_params *params;
 	struct bdaddr_list *b, *t;
 	u8 num_entries = 0;
 	bool pend_conn, pend_report;
 	u8 filter_policy;
+	size_t i, n;
 	int err;
 
 	/* Pause advertising if resolving list can be used as controllers
@@ -2504,6 +2571,7 @@ static u8 hci_update_accept_list_sync(struct hci_dev *hdev)
 		if (hci_conn_hash_lookup_le(hdev, &b->bdaddr, b->bdaddr_type))
 			continue;
 
+		/* Pointers not dereferenced, no locks needed */
 		pend_conn = hci_pend_le_action_lookup(&hdev->pend_le_conns,
 						      &b->bdaddr,
 						      b->bdaddr_type);
@@ -2532,22 +2600,49 @@ static u8 hci_update_accept_list_sync(struct hci_dev *hdev)
 	 * available accept list entries in the controller, then
 	 * just abort and return filer policy value to not use the
 	 * accept list.
+	 *
+	 * The list and params may be mutated while we wait for events,
+	 * so make a copy and iterate it.
 	 */
-	list_for_each_entry(params, &hdev->pend_le_conns, action) {
-		err = hci_le_add_accept_list_sync(hdev, params, &num_entries);
-		if (err)
-			goto done;
+
+	params = conn_params_copy(&hdev->pend_le_conns, &n);
+	if (!params) {
+		err = -ENOMEM;
+		goto done;
 	}
+
+	for (i = 0; i < n; ++i) {
+		err = hci_le_add_accept_list_sync(hdev, &params[i],
+						  &num_entries);
+		if (err) {
+			kvfree(params);
+			goto done;
+		}
+	}
+
+	kvfree(params);
 
 	/* After adding all new pending connections, walk through
 	 * the list of pending reports and also add these to the
 	 * accept list if there is still space. Abort if space runs out.
 	 */
-	list_for_each_entry(params, &hdev->pend_le_reports, action) {
-		err = hci_le_add_accept_list_sync(hdev, params, &num_entries);
-		if (err)
-			goto done;
+
+	params = conn_params_copy(&hdev->pend_le_reports, &n);
+	if (!params) {
+		err = -ENOMEM;
+		goto done;
 	}
+
+	for (i = 0; i < n; ++i) {
+		err = hci_le_add_accept_list_sync(hdev, &params[i],
+						  &num_entries);
+		if (err) {
+			kvfree(params);
+			goto done;
+		}
+	}
+
+	kvfree(params);
 
 	/* Use the allowlist unless the following conditions are all true:
 	 * - We are not currently suspending
@@ -4589,7 +4684,10 @@ static const struct {
 			 "advertised, but not supported."),
 	HCI_QUIRK_BROKEN(SET_RPA_TIMEOUT,
 			 "HCI LE Set Random Private Address Timeout command is "
-			 "advertised, but not supported.")
+			 "advertised, but not supported."),
+	HCI_QUIRK_BROKEN(LE_CODED,
+			 "HCI LE Coded PHY feature bit is set, "
+			 "but its usage is not supported.")
 };
 
 /* This function handles hdev setup stage:
@@ -4623,26 +4721,18 @@ static int hci_dev_setup_sync(struct hci_dev *hdev)
 	 * BD_ADDR invalid before creating the HCI device or in
 	 * its setup callback.
 	 */
-	invalid_bdaddr = test_bit(HCI_QUIRK_INVALID_BDADDR, &hdev->quirks);
-
+	invalid_bdaddr = test_bit(HCI_QUIRK_INVALID_BDADDR, &hdev->quirks) ||
+			 test_bit(HCI_QUIRK_USE_BDADDR_PROPERTY, &hdev->quirks);
 	if (!ret) {
-		if (test_bit(HCI_QUIRK_USE_BDADDR_PROPERTY, &hdev->quirks)) {
-			if (!bacmp(&hdev->public_addr, BDADDR_ANY))
-				hci_dev_get_bd_addr_from_property(hdev);
+		if (test_bit(HCI_QUIRK_USE_BDADDR_PROPERTY, &hdev->quirks) &&
+		    !bacmp(&hdev->public_addr, BDADDR_ANY))
+			hci_dev_get_bd_addr_from_property(hdev);
 
-			if (bacmp(&hdev->public_addr, BDADDR_ANY) &&
-			    hdev->set_bdaddr) {
-				ret = hdev->set_bdaddr(hdev,
-						       &hdev->public_addr);
-
-				/* If setting of the BD_ADDR from the device
-				 * property succeeds, then treat the address
-				 * as valid even if the invalid BD_ADDR
-				 * quirk indicates otherwise.
-				 */
-				if (!ret)
-					invalid_bdaddr = false;
-			}
+		if (invalid_bdaddr && bacmp(&hdev->public_addr, BDADDR_ANY) &&
+		    hdev->set_bdaddr) {
+			ret = hdev->set_bdaddr(hdev, &hdev->public_addr);
+			if (!ret)
+				invalid_bdaddr = false;
 		}
 	}
 
@@ -4845,12 +4935,12 @@ static void hci_pend_le_actions_clear(struct hci_dev *hdev)
 	struct hci_conn_params *p;
 
 	list_for_each_entry(p, &hdev->le_conn_params, list) {
+		hci_pend_le_list_del_init(p);
 		if (p->conn) {
 			hci_conn_drop(p->conn);
 			hci_conn_put(p->conn);
 			p->conn = NULL;
 		}
-		list_del_init(&p->action);
 	}
 
 	BT_DBG("All LE pending actions cleared");
@@ -5182,22 +5272,27 @@ static int hci_disconnect_sync(struct hci_dev *hdev, struct hci_conn *conn,
 }
 
 static int hci_le_connect_cancel_sync(struct hci_dev *hdev,
-				      struct hci_conn *conn)
+				      struct hci_conn *conn, u8 reason)
 {
+	/* Return reason if scanning since the connection shall probably be
+	 * cleanup directly.
+	 */
 	if (test_bit(HCI_CONN_SCANNING, &conn->flags))
-		return 0;
+		return reason;
 
-	if (test_and_set_bit(HCI_CONN_CANCEL, &conn->flags))
+	if (conn->role == HCI_ROLE_SLAVE ||
+	    test_and_set_bit(HCI_CONN_CANCEL, &conn->flags))
 		return 0;
 
 	return __hci_cmd_sync_status(hdev, HCI_OP_LE_CREATE_CONN_CANCEL,
 				     0, NULL, HCI_CMD_TIMEOUT);
 }
 
-static int hci_connect_cancel_sync(struct hci_dev *hdev, struct hci_conn *conn)
+static int hci_connect_cancel_sync(struct hci_dev *hdev, struct hci_conn *conn,
+				   u8 reason)
 {
 	if (conn->type == LE_LINK)
-		return hci_le_connect_cancel_sync(hdev, conn);
+		return hci_le_connect_cancel_sync(hdev, conn, reason);
 
 	if (hdev->hci_ver < BLUETOOTH_VER_1_2)
 		return 0;
@@ -5243,43 +5338,81 @@ static int hci_reject_conn_sync(struct hci_dev *hdev, struct hci_conn *conn,
 
 int hci_abort_conn_sync(struct hci_dev *hdev, struct hci_conn *conn, u8 reason)
 {
-	int err;
+	int err = 0;
+	u16 handle = conn->handle;
+	struct hci_conn *c;
 
 	switch (conn->state) {
 	case BT_CONNECTED:
 	case BT_CONFIG:
-		return hci_disconnect_sync(hdev, conn, reason);
+		err = hci_disconnect_sync(hdev, conn, reason);
+		break;
 	case BT_CONNECT:
-		err = hci_connect_cancel_sync(hdev, conn);
-		/* Cleanup hci_conn object if it cannot be cancelled as it
-		 * likelly means the controller and host stack are out of sync.
-		 */
-		if (err) {
+		err = hci_connect_cancel_sync(hdev, conn, reason);
+		break;
+	case BT_CONNECT2:
+		err = hci_reject_conn_sync(hdev, conn, reason);
+		break;
+	case BT_OPEN:
+		/* Cleanup bises that failed to be established */
+		if (test_and_clear_bit(HCI_CONN_BIG_SYNC_FAILED, &conn->flags)) {
 			hci_dev_lock(hdev);
-			hci_conn_failed(conn, err);
+			hci_conn_failed(conn, reason);
 			hci_dev_unlock(hdev);
 		}
-		return err;
-	case BT_CONNECT2:
-		return hci_reject_conn_sync(hdev, conn, reason);
-	default:
-		conn->state = BT_CLOSED;
 		break;
+	default:
+		hci_dev_lock(hdev);
+		conn->state = BT_CLOSED;
+		hci_disconn_cfm(conn, reason);
+		hci_conn_del(conn);
+		hci_dev_unlock(hdev);
+		return 0;
 	}
 
-	return 0;
+	hci_dev_lock(hdev);
+
+	/* Check if the connection hasn't been cleanup while waiting
+	 * commands to complete.
+	 */
+	c = hci_conn_hash_lookup_handle(hdev, handle);
+	if (!c || c != conn) {
+		err = 0;
+		goto unlock;
+	}
+
+	/* Cleanup hci_conn object if it cannot be cancelled as it
+	 * likelly means the controller and host stack are out of sync
+	 * or in case of LE it was still scanning so it can be cleanup
+	 * safely.
+	 */
+	hci_conn_failed(conn, reason);
+
+unlock:
+	hci_dev_unlock(hdev);
+	return err;
 }
 
 static int hci_disconnect_all_sync(struct hci_dev *hdev, u8 reason)
 {
-	struct hci_conn *conn, *tmp;
-	int err;
+	struct list_head *head = &hdev->conn_hash.list;
+	struct hci_conn *conn;
 
-	list_for_each_entry_safe(conn, tmp, &hdev->conn_hash.list, list) {
-		err = hci_abort_conn_sync(hdev, conn, reason);
-		if (err)
-			return err;
+	rcu_read_lock();
+	while ((conn = list_first_or_null_rcu(head, struct hci_conn, list))) {
+		/* Make sure the connection is not freed while unlocking */
+		conn = hci_conn_get(conn);
+		rcu_read_unlock();
+		/* Disregard possible errors since hci_conn_del shall have been
+		 * called even in case of errors had occurred since it would
+		 * then cause hci_conn_failed to be called which calls
+		 * hci_conn_del internally.
+		 */
+		hci_abort_conn_sync(hdev, conn, reason);
+		hci_conn_put(conn);
+		rcu_read_lock();
 	}
+	rcu_read_unlock();
 
 	return 0;
 }
@@ -6166,63 +6299,99 @@ int hci_le_create_conn_sync(struct hci_dev *hdev, struct hci_conn *conn)
 
 done:
 	if (err == -ETIMEDOUT)
-		hci_le_connect_cancel_sync(hdev, conn);
+		hci_le_connect_cancel_sync(hdev, conn, 0x00);
 
 	/* Re-enable advertising after the connection attempt is finished. */
 	hci_resume_advertising_sync(hdev);
 	return err;
 }
 
-int hci_le_create_cis_sync(struct hci_dev *hdev, struct hci_conn *conn)
+int hci_le_create_cis_sync(struct hci_dev *hdev)
 {
 	struct {
 		struct hci_cp_le_create_cis cp;
 		struct hci_cis cis[0x1f];
 	} cmd;
-	u8 cig;
-	struct hci_conn *hcon = conn;
+	struct hci_conn *conn;
+	u8 cig = BT_ISO_QOS_CIG_UNSET;
+
+	/* The spec allows only one pending LE Create CIS command at a time. If
+	 * the command is pending now, don't do anything. We check for pending
+	 * connections after each CIS Established event.
+	 *
+	 * BLUETOOTH CORE SPECIFICATION Version 5.3 | Vol 4, Part E
+	 * page 2566:
+	 *
+	 * If the Host issues this command before all the
+	 * HCI_LE_CIS_Established events from the previous use of the
+	 * command have been generated, the Controller shall return the
+	 * error code Command Disallowed (0x0C).
+	 *
+	 * BLUETOOTH CORE SPECIFICATION Version 5.3 | Vol 4, Part E
+	 * page 2567:
+	 *
+	 * When the Controller receives the HCI_LE_Create_CIS command, the
+	 * Controller sends the HCI_Command_Status event to the Host. An
+	 * HCI_LE_CIS_Established event will be generated for each CIS when it
+	 * is established or if it is disconnected or considered lost before
+	 * being established; until all the events are generated, the command
+	 * remains pending.
+	 */
 
 	memset(&cmd, 0, sizeof(cmd));
-	cmd.cis[0].acl_handle = cpu_to_le16(conn->parent->handle);
-	cmd.cis[0].cis_handle = cpu_to_le16(conn->handle);
-	cmd.cp.num_cis++;
-	cig = conn->iso_qos.ucast.cig;
 
 	hci_dev_lock(hdev);
 
 	rcu_read_lock();
 
+	/* Wait until previous Create CIS has completed */
+	list_for_each_entry_rcu(conn, &hdev->conn_hash.list, list) {
+		if (test_bit(HCI_CONN_CREATE_CIS, &conn->flags))
+			goto done;
+	}
+
+	/* Find CIG with all CIS ready */
+	list_for_each_entry_rcu(conn, &hdev->conn_hash.list, list) {
+		struct hci_conn *link;
+
+		if (hci_conn_check_create_cis(conn))
+			continue;
+
+		cig = conn->iso_qos.ucast.cig;
+
+		list_for_each_entry_rcu(link, &hdev->conn_hash.list, list) {
+			if (hci_conn_check_create_cis(link) > 0 &&
+			    link->iso_qos.ucast.cig == cig &&
+			    link->state != BT_CONNECTED) {
+				cig = BT_ISO_QOS_CIG_UNSET;
+				break;
+			}
+		}
+
+		if (cig != BT_ISO_QOS_CIG_UNSET)
+			break;
+	}
+
+	if (cig == BT_ISO_QOS_CIG_UNSET)
+		goto done;
+
 	list_for_each_entry_rcu(conn, &hdev->conn_hash.list, list) {
 		struct hci_cis *cis = &cmd.cis[cmd.cp.num_cis];
 
-		if (conn == hcon || conn->type != ISO_LINK ||
-		    conn->state == BT_CONNECTED ||
+		if (hci_conn_check_create_cis(conn) ||
 		    conn->iso_qos.ucast.cig != cig)
 			continue;
 
-		/* Check if all CIS(s) belonging to a CIG are ready */
-		if (!conn->parent || conn->parent->state != BT_CONNECTED ||
-		    conn->state != BT_CONNECT) {
-			cmd.cp.num_cis = 0;
-			break;
-		}
-
-		/* Group all CIS with state BT_CONNECT since the spec don't
-		 * allow to send them individually:
-		 *
-		 * BLUETOOTH CORE SPECIFICATION Version 5.3 | Vol 4, Part E
-		 * page 2566:
-		 *
-		 * If the Host issues this command before all the
-		 * HCI_LE_CIS_Established events from the previous use of the
-		 * command have been generated, the Controller shall return the
-		 * error code Command Disallowed (0x0C).
-		 */
+		set_bit(HCI_CONN_CREATE_CIS, &conn->flags);
 		cis->acl_handle = cpu_to_le16(conn->parent->handle);
 		cis->cis_handle = cpu_to_le16(conn->handle);
 		cmd.cp.num_cis++;
+
+		if (cmd.cp.num_cis >= ARRAY_SIZE(cmd.cis))
+			break;
 	}
 
+done:
 	rcu_read_unlock();
 
 	hci_dev_unlock(hdev);

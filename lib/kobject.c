@@ -281,8 +281,7 @@ int kobject_set_name_vargs(struct kobject *kobj, const char *fmt,
 		kfree_const(s);
 		if (!t)
 			return -ENOMEM;
-		strreplace(t, '/', '!');
-		s = t;
+		s = strreplace(t, '/', '!');
 	}
 	kfree_const(kobj->name);
 	kobj->name = s;
@@ -854,6 +853,11 @@ int kset_register(struct kset *k)
 
 	if (!k)
 		return -EINVAL;
+
+	if (!k->kobj.ktype) {
+		pr_err("must have a ktype to be initialized properly!\n");
+		return -EINVAL;
+	}
 
 	kset_init(k);
 	err = kobject_add_internal(&k->kobj);

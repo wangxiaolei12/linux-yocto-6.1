@@ -877,7 +877,7 @@ fail_out:
 	return err;
 }
 
-static int ramoops_remove(struct platform_device *pdev)
+static void ramoops_remove(struct platform_device *pdev)
 {
 	struct ramoops_context *cxt = &oops_cxt;
 
@@ -887,8 +887,6 @@ static int ramoops_remove(struct platform_device *pdev)
 	cxt->pstore.bufsize = 0;
 
 	ramoops_free_przs(cxt);
-
-	return 0;
 }
 
 static const struct of_device_id dt_match[] = {
@@ -898,7 +896,7 @@ static const struct of_device_id dt_match[] = {
 
 static struct platform_driver ramoops_driver = {
 	.probe		= ramoops_probe,
-	.remove		= ramoops_remove,
+	.remove_new	= ramoops_remove,
 	.driver		= {
 		.name		= "ramoops",
 		.of_match_table	= dt_match,
