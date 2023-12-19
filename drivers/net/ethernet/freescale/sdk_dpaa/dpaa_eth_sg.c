@@ -370,7 +370,8 @@ EXPORT_SYMBOL(dpa_buf_is_recyclable);
  * accommodate the shared info area of the skb.
  */
 static struct sk_buff *__hot contig_fd_to_skb(const struct dpa_priv_s *priv,
-	const struct qm_fd *fd, int *use_gro)
+					      const struct qm_fd *fd,
+					      bool *use_gro, bool dcl4c_valid)
 {
 	dma_addr_t addr = qm_fd_addr(fd);
 	ssize_t fd_off = dpa_fd_offset(fd);
@@ -407,7 +408,7 @@ static struct sk_buff *__hot contig_fd_to_skb(const struct dpa_priv_s *priv,
 	/* Peek at the parse results for csum validation */
 	parse_results = (const fm_prs_result_t *)(vaddr +
 				DPA_RX_PRIV_DATA_SIZE);
-	_dpa_process_parse_results(parse_results, fd, skb, use_gro);
+	_dpa_process_parse_results(parse_results, fd, skb, use_gro, dcl4c_valid);
 
 #ifdef CONFIG_FSL_DPAA_1588
 	if (priv->tsu && priv->tsu->valid && priv->tsu->hwts_rx_en_ioctl)
@@ -428,8 +429,8 @@ static struct sk_buff *__hot contig_fd_to_skb(const struct dpa_priv_s *priv,
  * The page fragment holding the S/G Table is recycled here.
  */
 static struct sk_buff *__hot sg_fd_to_skb(const struct dpa_priv_s *priv,
-			       const struct qm_fd *fd, int *use_gro,
-			       int *count_ptr)
+					  const struct qm_fd *fd, bool *use_gro,
+					  int *count_ptr, bool dcl4c_valid)
 {
 	const struct qm_sg_entry *sgt;
 	dma_addr_t addr = qm_fd_addr(fd);
@@ -484,7 +485,7 @@ static struct sk_buff *__hot sg_fd_to_skb(const struct dpa_priv_s *priv,
 			parse_results = (const fm_prs_result_t *)(vaddr +
 						DPA_RX_PRIV_DATA_SIZE);
 			_dpa_process_parse_results(parse_results, fd, skb,
-						   use_gro);
+						   use_gro, dcl4c_valid);
 
 			/* Make sure forwarded skbs will have enough space
 			 * on Tx, if extra headers are added.
@@ -565,13 +566,14 @@ void __hot _dpa_rx(struct net_device *net_dev,
 		u32 fqid,
 		int *count_ptr)
 {
+	bool dcl4c_valid = !!(net_dev->features & NETIF_F_RXCSUM);
+	bool use_gro = !!(net_dev->features & NETIF_F_GRO);
 	struct dpa_bp *dpa_bp;
 	struct sk_buff *skb;
 	dma_addr_t addr = qm_fd_addr(fd);
 	u32 fd_status = fd->status;
 	unsigned int skb_len;
 	struct rtnl_link_stats64 *percpu_stats = &percpu_priv->stats;
-	int use_gro = net_dev->features & NETIF_F_GRO;
 
 	if (unlikely(fd_status & FM_FD_STAT_RX_ERRORS) != 0) {
 		if (netif_msg_hw(priv) && net_ratelimit())
@@ -602,9 +604,9 @@ void __hot _dpa_rx(struct net_device *net_dev,
 			return;
 		}
 #endif
-		skb = contig_fd_to_skb(priv, fd, &use_gro);
+		skb = contig_fd_to_skb(priv, fd, &use_gro, dcl4c_valid);
 	} else {
-		skb = sg_fd_to_skb(priv, fd, &use_gro, count_ptr);
+		skb = sg_fd_to_skb(priv, fd, &use_gro, count_ptr, dcl4c_valid);
 		percpu_priv->rx_sg++;
 	}
 
