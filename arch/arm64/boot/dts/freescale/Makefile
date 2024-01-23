@@ -396,7 +396,8 @@ dtb-$(CONFIG_ARCH_MXC) += imx93-11x11-evk.dtb \
 			  imx93-11x11-evk-ecat.dtb \
 			  imx93-11x11-evk-dsa.dtb \
 			  imx93-11x11-evk-dsa-enetc.dtb \
-			  imx93-11x11-evk-dpdk.dtb
+			  imx93-11x11-evk-dpdk.dtb \
+			  imx8mm-evk-ecat-userspace.dtb
 
 imx93-11x11-evk-pmic-pf0900-dtbs := imx93-11x11-evk.dtb imx93-11x11-evk-pmic-pf0900.dtbo
 imx93-11x11-evk-pmic-pf0900-root-dtbs := imx93-11x11-evk-root.dtb imx93-11x11-evk-pmic-pf0900.dtbo
