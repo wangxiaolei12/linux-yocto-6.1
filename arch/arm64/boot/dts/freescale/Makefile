@@ -394,6 +394,7 @@ dtb-$(CONFIG_ARCH_MXC) += imx93-11x11-evk.dtb \
 			  imx93-11x11-evk-rpmsg.dtb imx93-11x11-evk-rpmsg-lpv.dtb \
 			  imx93-11x11-evk-uart-sharing-cm33.dtb \
 			  imx93-11x11-evk-ecat.dtb \
+			  imx93-11x11-evk-ecat-userspace.dtb \
 			  imx93-11x11-evk-dsa.dtb \
 			  imx93-11x11-evk-dsa-enetc.dtb \
 			  imx93-11x11-evk-dpdk.dtb \
