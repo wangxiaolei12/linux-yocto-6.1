@@ -316,12 +316,6 @@ static inline int macscsi_pread(struct NCR5380_hostdata *hostdata,
 		if (bytes >= 0)
 			continue;
 
-		if (bytes == 0)
-			udelay(MAC_PDMA_DELAY);
-
-		if (bytes >= 0)
-			continue;
-
 		dsprintk(NDEBUG_PSEUDO_DMA, hostdata->host,
 		         "%s: bus error (%d/%d)\n", __func__, d - dst, len);
 		NCR5380_dprint(NDEBUG_PSEUDO_DMA, hostdata->host);

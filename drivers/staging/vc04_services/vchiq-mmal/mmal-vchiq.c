@@ -404,8 +404,6 @@ buffer_from_host(struct vchiq_mmal_instance *instance,
 
 	atomic_inc(&port->buffers_with_vpu);
 
-	atomic_inc(&port->buffers_with_vpu);
-
 	/* prep the buffer from host message */
 	memset(&m, 0xbc, sizeof(m));	/* just to make debug clearer */
 

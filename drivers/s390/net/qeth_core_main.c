@@ -999,7 +999,6 @@ static void qeth_issue_next_read_cb(struct qeth_card *card,
 		rc = 0;
 		goto no_callback;
 	}
-	spin_unlock_irqrestore(&reply->lock, flags);
 
 	spin_lock_irqsave(&request->lock, flags);
 	if (request->rc)

@@ -26,6 +26,8 @@
 /* Bluetooth HCI event handling. */
 
 #include <asm/unaligned.h>
+#include <linux/crypto.h>
+#include <crypto/algapi.h>
 
 #include <net/bluetooth/bluetooth.h>
 #include <net/bluetooth/hci_core.h>
@@ -33,6 +35,7 @@
 
 #include "hci_request.h"
 #include "hci_debugfs.h"
+#include "hci_codec.h"
 #include "a2mp.h"
 #include "amp.h"
 #include "smp.h"
@@ -1639,7 +1642,7 @@ static u8 hci_cc_le_set_ext_adv_enable(struct hci_dev *hdev, void *data,
 
 		hci_dev_set_flag(hdev, HCI_LE_ADV);
 
-		if (adv)
+		if (adv && !adv->periodic)
 			adv->enabled = true;
 
 		conn = hci_lookup_le_connect(hdev);
@@ -1747,7 +1750,7 @@ static void store_pending_adv_report(struct hci_dev *hdev, bdaddr_t *bdaddr,
 {
 	struct discovery_state *d = &hdev->discovery;
 
-	if (len > HCI_MAX_AD_LENGTH)
+	if (len > max_adv_len(hdev))
 		return;
 
 	bacpy(&d->last_adv_addr, bdaddr);
@@ -3179,13 +3182,9 @@ static void hci_conn_complete_evt(struct hci_dev *hdev, void *data,
 	}
 
 	if (!status) {
-		conn->handle = __le16_to_cpu(ev->handle);
-		if (conn->handle > HCI_CONN_HANDLE_MAX) {
-			bt_dev_err(hdev, "Invalid handle: 0x%4.4x > 0x%4.4x",
-				   conn->handle, HCI_CONN_HANDLE_MAX);
-			status = HCI_ERROR_INVALID_PARAMETERS;
+		status = hci_conn_set_handle(conn, __le16_to_cpu(ev->handle));
+		if (status)
 			goto done;
-		}
 
 		if (conn->type == ACL_LINK) {
 			conn->state = BT_CONFIG;
@@ -3270,6 +3269,16 @@ static void hci_conn_request_evt(struct hci_dev *hdev, void *data,
 	__u8 flags = 0;
 
 	bt_dev_dbg(hdev, "bdaddr %pMR type 0x%x", &ev->bdaddr, ev->link_type);
+
+	/* Reject incoming connection from device with same BD ADDR against
+	 * CVE-2020-26555
+	 */
+	if (hdev && !bacmp(&hdev->bdaddr, &ev->bdaddr)) {
+		bt_dev_dbg(hdev, "Reject connection with same BD_ADDR %pMR\n",
+			   &ev->bdaddr);
+		hci_reject_conn(hdev, &ev->bdaddr);
+		return;
+	}
 
 	mask |= hci_proto_connect_ind(hdev, &ev->bdaddr, ev->link_type,
 				      &flags);
@@ -3868,11 +3877,9 @@ static u8 hci_cc_le_set_cig_params(struct hci_dev *hdev, void *data,
 		if (conn->state != BT_BOUND && conn->state != BT_CONNECT)
 			continue;
 
-		conn->handle = __le16_to_cpu(rp->handle[i]);
+		if (hci_conn_set_handle(conn, __le16_to_cpu(rp->handle[i])))
+			continue;
 
-		bt_dev_dbg(hdev, "%p handle 0x%4.4x parent %p", conn,
-			   conn->handle, conn->parent);
-		
 		if (conn->state == BT_CONNECT)
 			pending = true;
 	}
@@ -3960,24 +3967,47 @@ static u8 hci_cc_le_set_per_adv_enable(struct hci_dev *hdev, void *data,
 				       struct sk_buff *skb)
 {
 	struct hci_ev_status *rp = data;
-	__u8 *sent;
+	struct hci_cp_le_set_per_adv_enable *cp;
+	struct adv_info *adv = NULL, *n;
+	u8 per_adv_cnt = 0;
 
 	bt_dev_dbg(hdev, "status 0x%2.2x", rp->status);
 
 	if (rp->status)
 		return rp->status;
 
-	sent = hci_sent_cmd_data(hdev, HCI_OP_LE_SET_PER_ADV_ENABLE);
-	if (!sent)
+	cp = hci_sent_cmd_data(hdev, HCI_OP_LE_SET_PER_ADV_ENABLE);
+	if (!cp)
 		return rp->status;
 
 	hci_dev_lock(hdev);
 
-	if (*sent)
-		hci_dev_set_flag(hdev, HCI_LE_PER_ADV);
-	else
-		hci_dev_clear_flag(hdev, HCI_LE_PER_ADV);
+	adv = hci_find_adv_instance(hdev, cp->handle);
 
+	if (cp->enable) {
+		hci_dev_set_flag(hdev, HCI_LE_PER_ADV);
+
+		if (adv)
+			adv->enabled = true;
+	} else {
+		/* If just one instance was disabled check if there are
+		 * any other instance enabled before clearing HCI_LE_PER_ADV.
+		 * The current periodic adv instance will be marked as
+		 * disabled once extended advertising is also disabled.
+		 */
+		list_for_each_entry_safe(adv, n, &hdev->adv_instances,
+					 list) {
+			if (adv->periodic && adv->enabled)
+				per_adv_cnt++;
+		}
+
+		if (per_adv_cnt > 1)
+			goto unlock;
+
+		hci_dev_clear_flag(hdev, HCI_LE_PER_ADV);
+	}
+
+unlock:
 	hci_dev_unlock(hdev);
 
 	return rp->status;
@@ -4724,6 +4754,15 @@ static void hci_link_key_notify_evt(struct hci_dev *hdev, void *data,
 	if (!conn)
 		goto unlock;
 
+	/* Ignore NULL link key against CVE-2020-26555 */
+	if (!crypto_memneq(ev->link_key, ZERO_KEY, HCI_LINK_KEY_SIZE)) {
+		bt_dev_dbg(hdev, "Ignore NULL link key (ZERO KEY) for %pMR",
+			   &ev->bdaddr);
+		hci_disconnect(conn, HCI_ERROR_AUTH_FAILURE);
+		hci_conn_drop(conn);
+		goto unlock;
+	}
+
 	hci_conn_hold(conn);
 	conn->disc_timeout = HCI_DISCONN_TIMEOUT;
 	hci_conn_drop(conn);
@@ -5035,11 +5074,8 @@ static void hci_sync_conn_complete_evt(struct hci_dev *hdev, void *data,
 
 	switch (status) {
 	case 0x00:
-		conn->handle = __le16_to_cpu(ev->handle);
-		if (conn->handle > HCI_CONN_HANDLE_MAX) {
-			bt_dev_err(hdev, "Invalid handle: 0x%4.4x > 0x%4.4x",
-				   conn->handle, HCI_CONN_HANDLE_MAX);
-			status = HCI_ERROR_INVALID_PARAMETERS;
+		status = hci_conn_set_handle(conn, __le16_to_cpu(ev->handle));
+		if (status) {
 			conn->state = BT_CLOSED;
 			break;
 		}
@@ -5259,8 +5295,8 @@ static u8 bredr_oob_data_present(struct hci_conn *conn)
 		 * available, then do not declare that OOB data is
 		 * present.
 		 */
-		if (!memcmp(data->rand256, ZERO_KEY, 16) ||
-		    !memcmp(data->hash256, ZERO_KEY, 16))
+		if (!crypto_memneq(data->rand256, ZERO_KEY, 16) ||
+		    !crypto_memneq(data->hash256, ZERO_KEY, 16))
 			return 0x00;
 
 		return 0x02;
@@ -5270,8 +5306,8 @@ static u8 bredr_oob_data_present(struct hci_conn *conn)
 	 * not supported by the hardware, then check that if
 	 * P-192 data values are present.
 	 */
-	if (!memcmp(data->rand192, ZERO_KEY, 16) ||
-	    !memcmp(data->hash192, ZERO_KEY, 16))
+	if (!crypto_memneq(data->rand192, ZERO_KEY, 16) ||
+	    !crypto_memneq(data->hash192, ZERO_KEY, 16))
 		return 0x00;
 
 	return 0x01;
@@ -5288,7 +5324,7 @@ static void hci_io_capa_request_evt(struct hci_dev *hdev, void *data,
 	hci_dev_lock(hdev);
 
 	conn = hci_conn_hash_lookup_ba(hdev, ACL_LINK, &ev->bdaddr);
-	if (!conn)
+	if (!conn || !hci_conn_ssp_enabled(conn))
 		goto unlock;
 
 	hci_conn_hold(conn);
@@ -5535,7 +5571,7 @@ static void hci_simple_pair_complete_evt(struct hci_dev *hdev, void *data,
 	hci_dev_lock(hdev);
 
 	conn = hci_conn_hash_lookup_ba(hdev, ACL_LINK, &ev->bdaddr);
-	if (!conn)
+	if (!conn || !hci_conn_ssp_enabled(conn))
 		goto unlock;
 
 	/* Reset the authentication requirement to unknown */
@@ -6245,8 +6281,9 @@ static void process_adv_report(struct hci_dev *hdev, u8 type, bdaddr_t *bdaddr,
 		return;
 	}
 
-	if (!ext_adv && len > HCI_MAX_AD_LENGTH) {
-		bt_dev_err_ratelimited(hdev, "legacy adv larger than 31 bytes");
+	if (len > max_adv_len(hdev)) {
+		bt_dev_err_ratelimited(hdev,
+				       "adv larger than maximum supported");
 		return;
 	}
 
@@ -6311,7 +6348,8 @@ static void process_adv_report(struct hci_dev *hdev, u8 type, bdaddr_t *bdaddr,
 	 */
 	conn = check_pending_le_conn(hdev, bdaddr, bdaddr_type, bdaddr_resolved,
 				     type);
-	if (!ext_adv && conn && type == LE_ADV_IND && len <= HCI_MAX_AD_LENGTH) {
+	if (!ext_adv && conn && type == LE_ADV_IND &&
+	    len <= max_adv_len(hdev)) {
 		/* Store report for later inclusion by
 		 * mgmt_device_connected
 		 */
@@ -6452,7 +6490,7 @@ static void hci_le_adv_report_evt(struct hci_dev *hdev, void *data,
 					info->length + 1))
 			break;
 
-		if (info->length <= HCI_MAX_AD_LENGTH) {
+		if (info->length <= max_adv_len(hdev)) {
 			rssi = info->data[info->length];
 			process_adv_report(hdev, info->type, &info->bdaddr,
 					   info->bdaddr_type, NULL, 0, rssi,
@@ -6565,19 +6603,56 @@ static void hci_le_pa_sync_estabilished_evt(struct hci_dev *hdev, void *data,
 	struct hci_ev_le_pa_sync_established *ev = data;
 	int mask = hdev->link_mode;
 	__u8 flags = 0;
+	struct hci_conn *bis;
 
 	bt_dev_dbg(hdev, "status 0x%2.2x", ev->status);
-
-	if (ev->status)
-		return;
 
 	hci_dev_lock(hdev);
 
 	hci_dev_clear_flag(hdev, HCI_PA_SYNC);
 
 	mask |= hci_proto_connect_ind(hdev, &ev->bdaddr, ISO_LINK, &flags);
-	if (!(mask & HCI_LM_ACCEPT))
+	if (!(mask & HCI_LM_ACCEPT)) {
 		hci_le_pa_term_sync(hdev, ev->handle);
+		goto unlock;
+	}
+
+	if (!(flags & HCI_PROTO_DEFER))
+		goto unlock;
+
+	/* Add connection to indicate the PA sync event */
+	bis = hci_conn_add(hdev, ISO_LINK, BDADDR_ANY,
+			   HCI_ROLE_SLAVE);
+
+	if (!bis)
+		goto unlock;
+
+	if (ev->status)
+		set_bit(HCI_CONN_PA_SYNC_FAILED, &bis->flags);
+	else
+		set_bit(HCI_CONN_PA_SYNC, &bis->flags);
+
+	/* Notify connection to iso layer */
+	hci_connect_cfm(bis, ev->status);
+
+unlock:
+	hci_dev_unlock(hdev);
+}
+
+static void hci_le_per_adv_report_evt(struct hci_dev *hdev, void *data,
+				      struct sk_buff *skb)
+{
+	struct hci_ev_le_per_adv_report *ev = data;
+	int mask = hdev->link_mode;
+	__u8 flags = 0;
+
+	bt_dev_dbg(hdev, "sync_handle 0x%4.4x", le16_to_cpu(ev->sync_handle));
+
+	hci_dev_lock(hdev);
+
+	mask |= hci_proto_connect_ind(hdev, BDADDR_ANY, ISO_LINK, &flags);
+	if (!(mask & HCI_LM_ACCEPT))
+		hci_le_pa_term_sync(hdev, ev->sync_handle);
 
 	hci_dev_unlock(hdev);
 }
@@ -6721,11 +6796,6 @@ static void hci_le_remote_conn_param_req_evt(struct hci_dev *hdev, void *data,
 	if (!hcon || hcon->state != BT_CONNECTED)
 		return send_conn_param_neg_reply(hdev, handle,
 						 HCI_ERROR_UNKNOWN_CONN_ID);
-
-	if (min < hcon->le_conn_min_interval ||
-	    max > hcon->le_conn_max_interval)
-		return send_conn_param_neg_reply(hdev, handle,
-						 HCI_ERROR_INVALID_LL_PARAMS);
 
 	if (hci_check_conn_params(min, max, latency, timeout))
 		return send_conn_param_neg_reply(hdev, handle,
@@ -6972,12 +7042,20 @@ unlock:
 	hci_dev_unlock(hdev);
 }
 
+static int hci_iso_term_big_sync(struct hci_dev *hdev, void *data)
+{
+	u8 handle = PTR_UINT(data);
+
+	return hci_le_terminate_big_sync(hdev, handle,
+					 HCI_ERROR_LOCAL_HOST_TERM);
+}
+
 static void hci_le_create_big_complete_evt(struct hci_dev *hdev, void *data,
 					   struct sk_buff *skb)
 {
 	struct hci_evt_le_create_big_complete *ev = data;
 	struct hci_conn *conn;
-	__u8 bis_idx = 0;
+	__u8 i = 0;
 
 	BT_DBG("%s status 0x%2.2x", hdev->name, ev->status);
 
@@ -6995,7 +7073,9 @@ static void hci_le_create_big_complete_evt(struct hci_dev *hdev, void *data,
 		    conn->iso_qos.bcast.big != ev->handle)
 			continue;
 
-		conn->handle = __le16_to_cpu(ev->bis_handle[bis_idx++]);
+		if (hci_conn_set_handle(conn,
+					__le16_to_cpu(ev->bis_handle[i++])))
+			continue;
 
 		if (!ev->status) {
 			conn->state = BT_CONNECTED;
@@ -7014,16 +7094,17 @@ static void hci_le_create_big_complete_evt(struct hci_dev *hdev, void *data,
 		rcu_read_lock();
 	}
 
-	if (!ev->status && !bis_idx)
+	rcu_read_unlock();
+
+	if (!ev->status && !i)
 		/* If no BISes have been connected for the BIG,
 		 * terminate. This is in case all bound connections
 		 * have been closed before the BIG creation
 		 * has completed.
 		 */
-		hci_le_terminate_big_sync(hdev, ev->handle,
-					  HCI_ERROR_LOCAL_HOST_TERM);
+		hci_cmd_sync_queue(hdev, hci_iso_term_big_sync,
+				   UINT_PTR(ev->handle), NULL);
 
-	rcu_read_unlock();
 	hci_dev_unlock(hdev);
 }
 
@@ -7032,6 +7113,7 @@ static void hci_le_big_sync_established_evt(struct hci_dev *hdev, void *data,
 {
 	struct hci_evt_le_big_sync_estabilished *ev = data;
 	struct hci_conn *bis;
+	struct hci_conn *pa_sync;
 	int i;
 
 	bt_dev_dbg(hdev, "status 0x%2.2x", ev->status);
@@ -7041,6 +7123,15 @@ static void hci_le_big_sync_established_evt(struct hci_dev *hdev, void *data,
 		return;
 
 	hci_dev_lock(hdev);
+
+	if (!ev->status) {
+		pa_sync = hci_conn_hash_lookup_pa_sync(hdev, ev->handle);
+		if (pa_sync)
+			/* Also mark the BIG sync established event on the
+			 * associated PA sync hcon
+			 */
+			set_bit(HCI_CONN_BIG_SYNC, &pa_sync->flags);
+	}
 
 	for (i = 0; i < ev->num_bis; i++) {
 		u16 handle = le16_to_cpu(ev->bis[i]);
@@ -7054,6 +7145,10 @@ static void hci_le_big_sync_established_evt(struct hci_dev *hdev, void *data,
 				continue;
 			bis->handle = handle;
 		}
+
+		if (ev->status != 0x42)
+			/* Mark PA sync as established */
+			set_bit(HCI_CONN_PA_SYNC, &bis->flags);
 
 		bis->iso_qos.bcast.big = ev->handle;
 		memset(&interval, 0, sizeof(interval));
@@ -7167,6 +7262,11 @@ static const struct hci_le_ev {
 	HCI_LE_EV(HCI_EV_LE_PA_SYNC_ESTABLISHED,
 		  hci_le_pa_sync_estabilished_evt,
 		  sizeof(struct hci_ev_le_pa_sync_established)),
+	/* [0x0f = HCI_EV_LE_PER_ADV_REPORT] */
+	HCI_LE_EV_VL(HCI_EV_LE_PER_ADV_REPORT,
+				 hci_le_per_adv_report_evt,
+				 sizeof(struct hci_ev_le_per_adv_report),
+				 HCI_MAX_EVENT_SIZE),
 	/* [0x12 = HCI_EV_LE_EXT_ADV_SET_TERM] */
 	HCI_LE_EV(HCI_EV_LE_EXT_ADV_SET_TERM, hci_le_ext_adv_term_evt,
 		  sizeof(struct hci_evt_le_ext_adv_set_term)),

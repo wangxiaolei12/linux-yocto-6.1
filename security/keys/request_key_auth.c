@@ -69,9 +69,6 @@ static void request_key_auth_describe(const struct key *key,
 	if (!rka)
 		return;
 
-	if (!rka)
-		return;
-
 	seq_puts(m, "key:");
 	seq_puts(m, key->description);
 	if (key_is_positive(key))
@@ -181,7 +178,7 @@ struct key *request_key_auth_new(struct key *target, const char *op,
 	if (!rka->callout_info)
 		goto error_free_rka;
 	rka->callout_len = callout_len;
-	strlcpy(rka->op, op, sizeof(rka->op));
+	strscpy(rka->op, op, sizeof(rka->op));
 
 	/* see if the calling process is already servicing the key request of
 	 * another process */

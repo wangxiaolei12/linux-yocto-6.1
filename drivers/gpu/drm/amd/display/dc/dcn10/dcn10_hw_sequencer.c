@@ -3018,12 +3018,6 @@ void dcn10_post_unlock_program_front_end(
 			break;
 		}
 
-	for (i = 0; i < dc->res_pool->pipe_count; i++)
-		if (removed_pipe[i]) {
-			dc->hwss.optimize_bandwidth(dc, context);
-			break;
-		}
-
 	if (dc->hwseq->wa.DEGVIDCN10_254)
 		hubbub1_wm_change_req_wa(dc->res_pool->hubbub);
 }

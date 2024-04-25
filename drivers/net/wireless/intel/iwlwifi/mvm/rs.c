@@ -1176,15 +1176,8 @@ static void rs_drv_mac80211_tx_status(void *mvm_r,
 	    info->flags & IEEE80211_TX_CTL_NO_ACK)
 		return;
 
-	/* If it's locked we are in middle of init flow
-	 * just wait for next tx status to update the lq_sta data
-	 */
-	if (!mutex_trylock(&mvmsta->lq_sta.rs_drv.mutex))
-		return;
-
 	iwl_mvm_rs_tx_status(mvm, sta, rs_get_tid(hdr), info,
 			     ieee80211_is_qos_nullfunc(hdr->frame_control));
-	mutex_unlock(&mvmsta->lq_sta.rs_drv.mutex);
 }
 
 /*

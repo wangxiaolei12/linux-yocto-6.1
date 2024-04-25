@@ -3884,11 +3884,6 @@ static int read_compacted_summaries(struct f2fs_sb_info *sbi)
 		seg_i = CURSEG_I(sbi, i);
 		segno = le32_to_cpu(ckpt->cur_data_segno[i]);
 		blk_off = le16_to_cpu(ckpt->cur_data_blkoff[i]);
-		if (blk_off > ENTRIES_IN_SUM) {
-			f2fs_bug_on(sbi, 1);
-			f2fs_put_page(page, 1);
-			return -EFAULT;
-		}
 		seg_i->next_segno = segno;
 		reset_curseg(sbi, i, 0);
 		seg_i->alloc_type = ckpt->alloc_type[i];
@@ -4953,12 +4948,19 @@ static int check_zone_write_pointer(struct f2fs_sb_info *sbi,
 		    GET_BLKOFF_FROM_SEG0(sbi, last_valid_block),
 		    wp_segno, wp_blkoff);
 
-	ret = blkdev_issue_zeroout(fdev->bdev, zone->wp,
-				zone->len - (zone->wp - zone->start),
-				GFP_NOFS, 0);
-	if (ret)
-		f2fs_err(sbi, "Fill up zone failed: %s (errno=%d)",
-			 fdev->path, ret);
+	ret = blkdev_zone_mgmt(fdev->bdev, REQ_OP_ZONE_FINISH,
+				zone->start, zone->len, GFP_NOFS);
+	if (ret == -EOPNOTSUPP) {
+		ret = blkdev_issue_zeroout(fdev->bdev, zone->wp,
+					zone->len - (zone->wp - zone->start),
+					GFP_NOFS, 0);
+		if (ret)
+			f2fs_err(sbi, "Fill up zone failed: %s (errno=%d)",
+					fdev->path, ret);
+	} else if (ret) {
+		f2fs_err(sbi, "Finishing zone failed: %s (errno=%d)",
+				fdev->path, ret);
+	}
 
 	return ret;
 }

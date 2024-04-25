@@ -1473,11 +1473,6 @@ static int mos7840_probe(struct usb_serial *serial,
 	if (device_flags)
 		goto out;
 
-	if (vid == USB_VENDOR_ID_MOXA && product == MOXA_DEVICE_ID_2210) {
-		device_type = MOSCHIP_DEVICE_ID_7820;
-		goto out;
-	}
-
 	buf = kzalloc(VENDOR_READ_LENGTH, GFP_KERNEL);
 	if (!buf)
 		return -ENOMEM;

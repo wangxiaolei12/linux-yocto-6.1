@@ -734,6 +734,7 @@ struct iso_list_data {
 	};
 	int count;
 	bool big_term;
+	bool pa_sync_term;
 	bool big_sync_term;
 };
 
@@ -807,7 +808,10 @@ static int big_terminate_sync(struct hci_dev *hdev, void *data)
 	if (d->big_sync_term)
 		hci_le_big_terminate_sync(hdev, d->big);
 
-	return hci_le_pa_terminate_sync(hdev, d->sync_handle);
+	if (d->pa_sync_term)
+		return hci_le_pa_terminate_sync(hdev, d->sync_handle);
+
+	return 0;
 }
 
 static int hci_le_big_terminate(struct hci_dev *hdev, u8 big, struct hci_conn *conn)
@@ -823,6 +827,7 @@ static int hci_le_big_terminate(struct hci_dev *hdev, u8 big, struct hci_conn *c
 
 	d->big = big;
 	d->sync_handle = conn->sync_handle;
+	d->pa_sync_term = test_and_clear_bit(HCI_CONN_PA_SYNC, &conn->flags);
 	d->big_sync_term = test_and_clear_bit(HCI_CONN_BIG_SYNC, &conn->flags);
 
 	ret = hci_cmd_sync_queue(hdev, big_terminate_sync, d,
@@ -853,9 +858,7 @@ static void bis_cleanup(struct hci_conn *conn)
 		/* Check if ISO connection is a BIS and terminate advertising
 		 * set and BIG if there are no other connections using it.
 		 */
-		bis = hci_conn_hash_lookup_bis(hdev, BDADDR_ANY,
-					       conn->iso_qos.bcast.big,
-					       conn->iso_qos.bcast.bis);
+		bis = hci_conn_hash_lookup_big(hdev, conn->iso_qos.bcast.big);
 		if (bis)
 			return;
 
@@ -874,7 +877,7 @@ static void bis_cleanup(struct hci_conn *conn)
 
 static int remove_cig_sync(struct hci_dev *hdev, void *data)
 {
-	u8 handle = PTR_ERR(data);
+	u8 handle = PTR_UINT(data);
 
 	return hci_le_remove_cig_sync(hdev, handle);
 }
@@ -883,7 +886,8 @@ static int hci_le_remove_cig(struct hci_dev *hdev, u8 handle)
 {
 	bt_dev_dbg(hdev, "handle 0x%2.2x", handle);
 
-	return hci_cmd_sync_queue(hdev, remove_cig_sync, ERR_PTR(handle), NULL);
+	return hci_cmd_sync_queue(hdev, remove_cig_sync, UINT_PTR(handle),
+				  NULL);
 }
 
 static void find_cis(struct hci_conn *conn, void *data)
@@ -1248,9 +1252,41 @@ void hci_conn_failed(struct hci_conn *conn, u8 status)
 	hci_conn_del(conn);
 }
 
+/* This function requires the caller holds hdev->lock */
+u8 hci_conn_set_handle(struct hci_conn *conn, u16 handle)
+{
+	struct hci_dev *hdev = conn->hdev;
+
+	bt_dev_dbg(hdev, "hcon %p handle 0x%4.4x", conn, handle);
+
+	if (conn->handle == handle)
+		return 0;
+
+	if (handle > HCI_CONN_HANDLE_MAX) {
+		bt_dev_err(hdev, "Invalid handle: 0x%4.4x > 0x%4.4x",
+			   handle, HCI_CONN_HANDLE_MAX);
+		return HCI_ERROR_INVALID_PARAMETERS;
+	}
+
+	/* If abort_reason has been sent it means the connection is being
+	 * aborted and the handle shall not be changed.
+	 */
+	if (conn->abort_reason)
+		return conn->abort_reason;
+
+	conn->handle = handle;
+
+	return 0;
+}
+
 static void create_le_conn_complete(struct hci_dev *hdev, void *data, int err)
 {
-	struct hci_conn *conn = data;
+	struct hci_conn *conn;
+	u16 handle = PTR_UINT(data);
+
+	conn = hci_conn_hash_lookup_handle(hdev, handle);
+	if (!conn)
+		return;
 
 	bt_dev_dbg(hdev, "err %d", err);
 
@@ -1275,9 +1311,17 @@ done:
 
 static int hci_connect_le_sync(struct hci_dev *hdev, void *data)
 {
-	struct hci_conn *conn = data;
+	struct hci_conn *conn;
+	u16 handle = PTR_UINT(data);
+
+	conn = hci_conn_hash_lookup_handle(hdev, handle);
+	if (!conn)
+		return 0;
 
 	bt_dev_dbg(hdev, "conn %p", conn);
+
+	clear_bit(HCI_CONN_SCANNING, &conn->flags);
+	conn->state = BT_CONNECT;
 
 	return hci_le_create_conn_sync(hdev, conn);
 }
@@ -1348,10 +1392,8 @@ struct hci_conn *hci_connect_le(struct hci_dev *hdev, bdaddr_t *dst,
 	conn->sec_level = BT_SECURITY_LOW;
 	conn->conn_timeout = conn_timeout;
 
-	conn->state = BT_CONNECT;
-	clear_bit(HCI_CONN_SCANNING, &conn->flags);
-
-	err = hci_cmd_sync_queue(hdev, hci_connect_le_sync, conn,
+	err = hci_cmd_sync_queue(hdev, hci_connect_le_sync,
+				 UINT_PTR(conn->handle),
 				 create_le_conn_complete);
 	if (err) {
 		hci_conn_del(conn);
@@ -1415,25 +1457,23 @@ static int hci_explicit_conn_params_set(struct hci_dev *hdev,
 
 static int qos_set_big(struct hci_dev *hdev, struct bt_iso_qos *qos)
 {
-	struct iso_list_data data;
+	struct hci_conn *conn;
+	u8  big;
 
 	/* Allocate a BIG if not set */
 	if (qos->bcast.big == BT_ISO_QOS_BIG_UNSET) {
-		for (data.big = 0x00; data.big < 0xef; data.big++) {
-			data.count = 0;
-			data.bis = 0xff;
+		for (big = 0x00; big < 0xef; big++) {
 
-			hci_conn_hash_list_state(hdev, bis_list, ISO_LINK,
-						 BT_BOUND, &data);
-			if (!data.count)
+			conn = hci_conn_hash_lookup_big(hdev, big);
+			if (!conn)
 				break;
 		}
 
-		if (data.big == 0xef)
+		if (big == 0xef)
 			return -EADDRNOTAVAIL;
 
 		/* Update BIG */
-		qos->bcast.big = data.big;
+		qos->bcast.big = big;
 	}
 
 	return 0;
@@ -1441,28 +1481,27 @@ static int qos_set_big(struct hci_dev *hdev, struct bt_iso_qos *qos)
 
 static int qos_set_bis(struct hci_dev *hdev, struct bt_iso_qos *qos)
 {
-	struct iso_list_data data;
+	struct hci_conn *conn;
+	u8  bis;
 
 	/* Allocate BIS if not set */
 	if (qos->bcast.bis == BT_ISO_QOS_BIS_UNSET) {
 		/* Find an unused adv set to advertise BIS, skip instance 0x00
 		 * since it is reserved as general purpose set.
 		 */
-		for (data.bis = 0x01; data.bis < hdev->le_num_of_adv_sets;
-		     data.bis++) {
-			data.count = 0;
+		for (bis = 0x01; bis < hdev->le_num_of_adv_sets;
+		     bis++) {
 
-			hci_conn_hash_list_state(hdev, bis_list, ISO_LINK,
-						 BT_BOUND, &data);
-			if (!data.count)
+			conn = hci_conn_hash_lookup_bis(hdev, BDADDR_ANY, bis);
+			if (!conn)
 				break;
 		}
 
-		if (data.bis == hdev->le_num_of_adv_sets)
+		if (bis == hdev->le_num_of_adv_sets)
 			return -EADDRNOTAVAIL;
 
 		/* Update BIS */
-		qos->bcast.bis = data.bis;
+		qos->bcast.bis = bis;
 	}
 
 	return 0;
@@ -1500,8 +1539,7 @@ static struct hci_conn *hci_add_bis(struct hci_dev *hdev, bdaddr_t *dst,
 	/* Check BIS settings against other bound BISes, since all
 	 * BISes in a BIG must have the same value for all parameters
 	 */
-	conn = hci_conn_hash_lookup_bis(hdev, dst, qos->bcast.big,
-					qos->bcast.bis);
+	conn = hci_conn_hash_lookup_big(hdev, qos->bcast.big);
 
 	if (conn && (memcmp(qos, &conn->iso_qos, sizeof(*qos)) ||
 		     base_len != conn->le_per_adv_data_len ||
@@ -1587,6 +1625,15 @@ struct hci_conn *hci_connect_acl(struct hci_dev *hdev, bdaddr_t *dst,
 			return ERR_PTR(-ECONNREFUSED);
 
 		return ERR_PTR(-EOPNOTSUPP);
+	}
+
+	/* Reject outgoing connection to device with same BD ADDR against
+	 * CVE-2020-26555
+	 */
+	if (!bacmp(&hdev->bdaddr, dst)) {
+		bt_dev_dbg(hdev, "Reject connection with same BD_ADDR %pMR\n",
+			   dst);
+		return ERR_PTR(-ECONNREFUSED);
 	}
 
 	acl = hci_conn_hash_lookup_ba(hdev, ACL_LINK, dst);
@@ -1719,7 +1766,7 @@ static int hci_le_create_big(struct hci_conn *conn, struct bt_iso_qos *qos)
 
 static int set_cig_params_sync(struct hci_dev *hdev, void *data)
 {
-	u8 cig_id = PTR_ERR(data);
+	u8 cig_id = PTR_UINT(data);
 	struct hci_conn *conn;
 	struct bt_iso_qos *qos;
 	struct iso_cig_params pdu;
@@ -1829,7 +1876,7 @@ static bool hci_le_set_cig_params(struct hci_conn *conn, struct bt_iso_qos *qos)
 
 done:
 	if (hci_cmd_sync_queue(hdev, set_cig_params_sync,
-			       ERR_PTR(qos->ucast.cig), NULL) < 0)
+			       UINT_PTR(qos->ucast.cig), NULL) < 0)
 		return false;
 
 	return true;
@@ -1848,6 +1895,8 @@ struct hci_conn *hci_bind_cis(struct hci_dev *hdev, bdaddr_t *dst,
 			return ERR_PTR(-ENOMEM);
 		cis->cleanup = cis_cleanup;
 		cis->dst_type = dst_type;
+		cis->iso_qos.ucast.cig = BT_ISO_QOS_CIG_UNSET;
+		cis->iso_qos.ucast.cis = BT_ISO_QOS_CIS_UNSET;
 	}
 
 	if (cis->state == BT_CONNECTED)
@@ -1890,6 +1939,8 @@ struct hci_conn *hci_bind_cis(struct hci_dev *hdev, bdaddr_t *dst,
 		hci_conn_drop(cis);
 		return ERR_PTR(-EINVAL);
 	}
+
+	hci_conn_hold(cis);
 
 	cis->iso_qos = *qos;
 	cis->state = BT_BOUND;
@@ -2078,7 +2129,8 @@ int hci_pa_create_sync(struct hci_dev *hdev, bdaddr_t *dst, __u8 dst_type,
 	return hci_cmd_sync_queue(hdev, create_pa_sync, cp, create_pa_complete);
 }
 
-int hci_le_big_create_sync(struct hci_dev *hdev, struct bt_iso_qos *qos,
+int hci_le_big_create_sync(struct hci_dev *hdev, struct hci_conn *hcon,
+			   struct bt_iso_qos *qos,
 			   __u16 sync_handle, __u8 num_bis, __u8 bis[])
 {
 	struct _packed {
@@ -2093,6 +2145,9 @@ int hci_le_big_create_sync(struct hci_dev *hdev, struct bt_iso_qos *qos,
 	err = qos_set_big(hdev, qos);
 	if (err)
 		return err;
+
+	if (hcon)
+		hcon->iso_qos.bcast.big = qos->bcast.big;
 
 	memset(&pdu, 0, sizeof(pdu));
 	pdu.cp.handle = qos->bcast.big;
@@ -2244,6 +2299,9 @@ struct hci_conn *hci_connect_cis(struct hci_dev *hdev, bdaddr_t *dst,
 		return ERR_PTR(-ENOLINK);
 	}
 
+	/* Link takes the refcount */
+	hci_conn_drop(cis);
+
 	cis->state = BT_CONNECT;
 
 	hci_le_create_cis_pending(hdev);
@@ -2364,34 +2422,41 @@ int hci_conn_security(struct hci_conn *conn, __u8 sec_level, __u8 auth_type,
 	if (!test_bit(HCI_CONN_AUTH, &conn->flags))
 		goto auth;
 
-	/* An authenticated FIPS approved combination key has sufficient
-	 * security for security level 4. */
-	if (conn->key_type == HCI_LK_AUTH_COMBINATION_P256 &&
-	    sec_level == BT_SECURITY_FIPS)
-		goto encrypt;
-
-	/* An authenticated combination key has sufficient security for
-	   security level 3. */
-	if ((conn->key_type == HCI_LK_AUTH_COMBINATION_P192 ||
-	     conn->key_type == HCI_LK_AUTH_COMBINATION_P256) &&
-	    sec_level == BT_SECURITY_HIGH)
-		goto encrypt;
-
-	/* An unauthenticated combination key has sufficient security for
-	   security level 1 and 2. */
-	if ((conn->key_type == HCI_LK_UNAUTH_COMBINATION_P192 ||
-	     conn->key_type == HCI_LK_UNAUTH_COMBINATION_P256) &&
-	    (sec_level == BT_SECURITY_MEDIUM || sec_level == BT_SECURITY_LOW))
-		goto encrypt;
-
-	/* A combination key has always sufficient security for the security
-	   levels 1 or 2. High security level requires the combination key
-	   is generated using maximum PIN code length (16).
-	   For pre 2.1 units. */
-	if (conn->key_type == HCI_LK_COMBINATION &&
-	    (sec_level == BT_SECURITY_MEDIUM || sec_level == BT_SECURITY_LOW ||
-	     conn->pin_length == 16))
-		goto encrypt;
+	switch (conn->key_type) {
+	case HCI_LK_AUTH_COMBINATION_P256:
+		/* An authenticated FIPS approved combination key has
+		 * sufficient security for security level 4 or lower.
+		 */
+		if (sec_level <= BT_SECURITY_FIPS)
+			goto encrypt;
+		break;
+	case HCI_LK_AUTH_COMBINATION_P192:
+		/* An authenticated combination key has sufficient security for
+		 * security level 3 or lower.
+		 */
+		if (sec_level <= BT_SECURITY_HIGH)
+			goto encrypt;
+		break;
+	case HCI_LK_UNAUTH_COMBINATION_P192:
+	case HCI_LK_UNAUTH_COMBINATION_P256:
+		/* An unauthenticated combination key has sufficient security
+		 * for security level 2 or lower.
+		 */
+		if (sec_level <= BT_SECURITY_MEDIUM)
+			goto encrypt;
+		break;
+	case HCI_LK_COMBINATION:
+		/* A combination key has always sufficient security for the
+		 * security levels 2 or lower. High security level requires the
+		 * combination key is generated using maximum PIN code length
+		 * (16). For pre 2.1 units.
+		 */
+		if (sec_level <= BT_SECURITY_MEDIUM || conn->pin_length == 16)
+			goto encrypt;
+		break;
+	default:
+		break;
+	}
 
 auth:
 	if (test_bit(HCI_CONN_ENCRYPT_PEND, &conn->flags))
@@ -2836,7 +2901,7 @@ u32 hci_conn_get_phy(struct hci_conn *conn)
 static int abort_conn_sync(struct hci_dev *hdev, void *data)
 {
 	struct hci_conn *conn;
-	u16 handle = PTR_ERR(data);
+	u16 handle = PTR_UINT(data);
 
 	conn = hci_conn_hash_lookup_handle(hdev, handle);
 	if (!conn)
@@ -2862,6 +2927,9 @@ int hci_abort_conn(struct hci_conn *conn, u8 reason)
 	/* If the connection is pending check the command opcode since that
 	 * might be blocking on hci_cmd_sync_work while waiting its respective
 	 * event so we need to hci_cmd_sync_cancel to cancel it.
+	 *
+	 * hci_connect_le serializes the connection attempts so only one
+	 * connection can be in BT_CONNECT at time.
 	 */
 	if (conn->state == BT_CONNECT && hdev->req_status == HCI_REQ_PEND) {
 		switch (hci_skb_event(hdev->sent_cmd)) {
@@ -2873,6 +2941,6 @@ int hci_abort_conn(struct hci_conn *conn, u8 reason)
 		}
 	}
 
-	return hci_cmd_sync_queue(hdev, abort_conn_sync, ERR_PTR(conn->handle),
+	return hci_cmd_sync_queue(hdev, abort_conn_sync, UINT_PTR(conn->handle),
 				  NULL);
 }

@@ -19,9 +19,9 @@
 #include <linux/interrupt.h>
 #include <linux/crypto.h>
 #include <linux/hw_random.h>
-#include <linux/of_address.h>
+#include <linux/of.h>
 #include <linux/of_irq.h>
-#include <linux/of_platform.h>
+#include <linux/platform_device.h>
 #include <linux/dma-mapping.h>
 #include <linux/io.h>
 #include <linux/spinlock.h>
@@ -319,21 +319,6 @@ static int talitos_submit(struct device *dev, int ch, struct talitos_desc *desc,
 	spin_unlock_irqrestore(&priv->chan[ch].head_lock, flags);
 
 	return -EINPROGRESS;
-}
-
-static __be32 get_request_hdr(struct talitos_request *request, bool is_sec1)
-{
-	struct talitos_edesc *edesc;
-
-	if (!is_sec1)
-		return request->desc->hdr;
-
-	if (!request->desc->next_desc)
-		return request->desc->hdr1;
-
-	edesc = container_of(request->desc, struct talitos_edesc, desc);
-
-	return ((struct talitos_desc *)(edesc->buf + edesc->dma_len))->hdr1;
 }
 
 static __be32 get_request_hdr(struct talitos_request *request, bool is_sec1)
@@ -1069,10 +1054,6 @@ static void ipsec_esp_decrypt_swauth_done(struct device *dev,
 	ipsec_esp_unmap(dev, edesc, req, false);
 
 	if (!err) {
-		char icvdata[SHA512_DIGEST_SIZE];
-		int nents = edesc->dst_nents ? : 1;
-		unsigned int len = req->assoclen + req->cryptlen;
-
 		/* auth check */
 		oicv = edesc->buf + edesc->dma_len;
 		icv = oicv - authsize;
@@ -1544,18 +1525,6 @@ static int skcipher_aes_setkey(struct crypto_skcipher *cipher,
 	if (keylen == AES_KEYSIZE_128 || keylen == AES_KEYSIZE_192 ||
 	    keylen == AES_KEYSIZE_256)
 		return skcipher_setkey(cipher, key, keylen);
-
-	return -EINVAL;
-}
-
-static int ablkcipher_aes_setkey(struct crypto_ablkcipher *cipher,
-				  const u8 *key, unsigned int keylen)
-{
-	if (keylen == AES_KEYSIZE_128 || keylen == AES_KEYSIZE_192 ||
-	    keylen == AES_KEYSIZE_256)
-		return ablkcipher_setkey(cipher, key, keylen);
-
-	crypto_ablkcipher_set_flags(cipher, CRYPTO_TFM_RES_BAD_KEY_LEN);
 
 	return -EINVAL;
 }

@@ -367,14 +367,6 @@ static int find_next_iomem_res(resource_size_t start, resource_size_t end,
 		};
 	}
 
-	if (p) {
-		/* copy data */
-		res->start = max(start, p->start);
-		res->end = min(end, p->end);
-		res->flags = p->flags;
-		res->desc = p->desc;
-	}
-
 	read_unlock(&resource_lock);
 	return p ? 0 : -ENODEV;
 }

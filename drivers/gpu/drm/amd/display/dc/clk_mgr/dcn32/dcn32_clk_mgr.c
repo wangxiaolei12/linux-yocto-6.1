@@ -297,7 +297,7 @@ void dcn32_update_clocks_update_dpp_dto(struct clk_mgr_internal *clk_mgr,
 
 	clk_mgr->dccg->ref_dppclk = clk_mgr->base.clks.dppclk_khz;
 	for (i = 0; i < clk_mgr->base.ctx->dc->res_pool->pipe_count; i++) {
-		int dpp_inst, dppclk_khz, prev_dppclk_khz;
+		int dpp_inst = 0, dppclk_khz, prev_dppclk_khz;
 
 		dppclk_khz = context->res_ctx.pipe_ctx[i].plane_res.bw.dppclk_khz;
 
@@ -355,7 +355,7 @@ static void dcn32_update_clocks_update_dentist(
 			int32_t N;
 			int32_t j;
 
-			if (!pipe_ctx->stream)
+			if (!resource_is_pipe_type(pipe_ctx, OTG_MASTER))
 				continue;
 			/* Virtual encoders don't have this function */
 			if (!stream_enc->funcs->get_fifo_cal_average_level)
@@ -401,7 +401,7 @@ static void dcn32_update_clocks_update_dentist(
 			int32_t N;
 			int32_t j;
 
-			if (!pipe_ctx->stream)
+			if (!resource_is_pipe_type(pipe_ctx, OTG_MASTER))
 				continue;
 			/* Virtual encoders don't have this function */
 			if (!stream_enc->funcs->get_fifo_cal_average_level)
@@ -554,6 +554,11 @@ static void dcn32_update_clocks(struct clk_mgr *clk_mgr_base,
 				}
 			}
 		}
+
+		if (context->bw_ctx.bw.dcn.clk.fw_based_mclk_switching)
+			dcn32_smu_wait_for_dmub_ack_mclk(clk_mgr, true);
+		else
+			dcn32_smu_wait_for_dmub_ack_mclk(clk_mgr, false);
 
 		/* Always update saved value, even if new value not set due to P-State switching unsupported. Also check safe_to_lower for FCLK */
 		if (safe_to_lower && (clk_mgr_base->clks.fclk_p_state_change_support != clk_mgr_base->clks.fclk_prev_p_state_change_support)) {

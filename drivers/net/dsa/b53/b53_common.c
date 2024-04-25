@@ -575,8 +575,6 @@ int b53_enable_port(struct dsa_switch *ds, int port, struct phy_device *phy)
 	b53_port_set_mcast_flood(dev, port, true);
 	b53_port_set_learning(dev, port, false);
 
-	b53_br_egress_floods(ds, port, true, true);
-
 	if (dev->ops->irq_enable)
 		ret = dev->ops->irq_enable(dev, port);
 	if (ret)
@@ -1395,12 +1393,6 @@ static void b53_phylink_get_caps(struct dsa_switch *ds, int port,
 	/* Get the implementation specific capabilities */
 	if (dev->ops->phylink_get_caps)
 		dev->ops->phylink_get_caps(dev, port, config);
-
-	/* This driver does not make use of the speed, duplex, pause or the
-	 * advertisement in its mac_config, so it is safe to mark this driver
-	 * as non-legacy.
-	 */
-	config->legacy_pre_march2020 = false;
 }
 
 static struct phylink_pcs *b53_phylink_mac_select_pcs(struct dsa_switch *ds,

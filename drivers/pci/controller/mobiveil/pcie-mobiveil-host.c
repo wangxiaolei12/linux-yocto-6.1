@@ -17,9 +17,6 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/msi.h>
-#include <linux/of_address.h>
-#include <linux/of_irq.h>
-#include <linux/of_platform.h>
 #include <linux/of_pci.h>
 #include <linux/pci.h>
 #include <linux/platform_device.h>
@@ -232,12 +229,6 @@ int mobiveil_host_init(struct mobiveil_pcie *pcie, bool reinit)
 		value |= 0x00ff0100;
 		mobiveil_csr_writel(pcie, value, PCI_PRIMARY_BUS);
 	}
-
-	/* setup bus numbers */
-	value = csr_readl(pcie, PCI_PRIMARY_BUS);
-	value &= 0xff000000;
-	value |= 0x00ff0100;
-	csr_writel(pcie, value, PCI_PRIMARY_BUS);
 
 	/*
 	 * program Bus Master Enable Bit in Command Register in PAB Config

@@ -3,6 +3,7 @@
  * BlueZ - Bluetooth protocol stack for Linux
  *
  * Copyright (C) 2021 Intel Corporation
+ * Copyright 2023 NXP
  */
 
 #include <linux/property.h>
@@ -412,11 +413,6 @@ static int hci_le_scan_restart_sync(struct hci_dev *hdev)
 					   LE_SCAN_FILTER_DUP_ENABLE);
 }
 
-static int le_scan_restart_sync(struct hci_dev *hdev, void *data)
-{
-	return hci_le_scan_restart_sync(hdev);
-}
-
 static void le_scan_restart(struct work_struct *work)
 {
 	struct hci_dev *hdev = container_of(work, struct hci_dev,
@@ -426,14 +422,14 @@ static void le_scan_restart(struct work_struct *work)
 
 	bt_dev_dbg(hdev, "");
 
-	hci_dev_lock(hdev);
-
-	status = hci_cmd_sync_queue(hdev, le_scan_restart_sync, NULL, NULL);
+	status = hci_le_scan_restart_sync(hdev);
 	if (status) {
 		bt_dev_err(hdev, "failed to restart LE scan: status %d",
 			   status);
-		goto unlock;
+		return;
 	}
+
+	hci_dev_lock(hdev);
 
 	if (!test_bit(HCI_QUIRK_STRICT_DUPLICATE_FILTER, &hdev->quirks) ||
 	    !hdev->discovery.scan_start)
@@ -1319,9 +1315,11 @@ int hci_start_ext_adv_sync(struct hci_dev *hdev, u8 instance)
 static int hci_disable_per_advertising_sync(struct hci_dev *hdev, u8 instance)
 {
 	struct hci_cp_le_set_per_adv_enable cp;
+	struct adv_info *adv = NULL;
 
 	/* If periodic advertising already disabled there is nothing to do. */
-	if (!hci_dev_test_flag(hdev, HCI_LE_PER_ADV))
+	adv = hci_find_adv_instance(hdev, instance);
+	if (!adv || !adv->periodic || !adv->enabled)
 		return 0;
 
 	memset(&cp, 0, sizeof(cp));
@@ -1386,9 +1384,11 @@ static int hci_set_per_adv_data_sync(struct hci_dev *hdev, u8 instance)
 static int hci_enable_per_advertising_sync(struct hci_dev *hdev, u8 instance)
 {
 	struct hci_cp_le_set_per_adv_enable cp;
+	struct adv_info *adv = NULL;
 
 	/* If periodic advertising already enabled there is nothing to do. */
-	if (hci_dev_test_flag(hdev, HCI_LE_PER_ADV))
+	adv = hci_find_adv_instance(hdev, instance);
+	if (adv && adv->periodic && adv->enabled)
 		return 0;
 
 	memset(&cp, 0, sizeof(cp));
@@ -1458,22 +1458,19 @@ int hci_start_per_adv_sync(struct hci_dev *hdev, u8 instance, u8 data_len,
 						   sync_interval);
 			if (IS_ERR(adv))
 				return PTR_ERR(adv);
+			adv->pending = false;
 			added = true;
 		}
 	}
 
-	/* Only start advertising if instance 0 or if a dedicated instance has
-	 * been added.
-	 */
-	if (!adv || added) {
-		err = hci_start_ext_adv_sync(hdev, instance);
-		if (err < 0)
-			goto fail;
+	/* Start advertising */
+	err = hci_start_ext_adv_sync(hdev, instance);
+	if (err < 0)
+		goto fail;
 
-		err = hci_adv_bcast_annoucement(hdev, adv);
-		if (err < 0)
-			goto fail;
-	}
+	err = hci_adv_bcast_annoucement(hdev, adv);
+	if (err < 0)
+		goto fail;
 
 	err = hci_set_per_adv_params_sync(hdev, instance, min_interval,
 					  max_interval);
@@ -2668,27 +2665,6 @@ done:
 
 	/* Select filter policy to use accept list */
 	return filter_policy;
-}
-
-/* Returns true if an le connection is in the scanning state */
-static inline bool hci_is_le_conn_scanning(struct hci_dev *hdev)
-{
-	struct hci_conn_hash *h = &hdev->conn_hash;
-	struct hci_conn  *c;
-
-	rcu_read_lock();
-
-	list_for_each_entry_rcu(c, &h->list, list) {
-		if (c->type == LE_LINK && c->state == BT_CONNECT &&
-		    test_bit(HCI_CONN_SCANNING, &c->flags)) {
-			rcu_read_unlock();
-			return true;
-		}
-	}
-
-	rcu_read_unlock();
-
-	return false;
 }
 
 static int hci_le_set_ext_scan_param_sync(struct hci_dev *hdev, u8 type,
@@ -4133,10 +4109,13 @@ static int hci_le_set_event_mask_sync(struct hci_dev *hdev)
 	}
 
 	if (bis_capable(hdev)) {
+		events[1] |= 0x20;	/* LE PA Report */
+		events[1] |= 0x40;	/* LE PA Sync Established */
 		events[3] |= 0x04;	/* LE Create BIG Complete */
 		events[3] |= 0x08;	/* LE Terminate BIG Complete */
 		events[3] |= 0x10;	/* LE BIG Sync Established */
 		events[3] |= 0x20;	/* LE BIG Sync Loss */
+		events[4] |= 0x02;	/* LE BIG Info Advertising Report */
 	}
 
 	return __hci_cmd_sync_status(hdev, HCI_OP_LE_SET_EVENT_MASK,
@@ -5095,6 +5074,7 @@ int hci_dev_close_sync(struct hci_dev *hdev)
 	memset(hdev->eir, 0, sizeof(hdev->eir));
 	memset(hdev->dev_class, 0, sizeof(hdev->dev_class));
 	bacpy(&hdev->random_addr, BDADDR_ANY);
+	hci_codec_list_clear(&hdev->local_codecs);
 
 	hci_dev_put(hdev);
 	return err;
@@ -5294,8 +5274,41 @@ static int hci_connect_cancel_sync(struct hci_dev *hdev, struct hci_conn *conn,
 	if (conn->type == LE_LINK)
 		return hci_le_connect_cancel_sync(hdev, conn, reason);
 
+	if (conn->type == ISO_LINK) {
+		/* BLUETOOTH CORE SPECIFICATION Version 5.3 | Vol 4, Part E
+		 * page 1857:
+		 *
+		 * If this command is issued for a CIS on the Central and the
+		 * CIS is successfully terminated before being established,
+		 * then an HCI_LE_CIS_Established event shall also be sent for
+		 * this CIS with the Status Operation Cancelled by Host (0x44).
+		 */
+		if (test_bit(HCI_CONN_CREATE_CIS, &conn->flags))
+			return hci_disconnect_sync(hdev, conn, reason);
+
+		/* CIS with no Create CIS sent have nothing to cancel */
+		if (bacmp(&conn->dst, BDADDR_ANY))
+			return HCI_ERROR_LOCAL_HOST_TERM;
+
+		/* There is no way to cancel a BIS without terminating the BIG
+		 * which is done later on connection cleanup.
+		 */
+		return 0;
+	}
+
 	if (hdev->hci_ver < BLUETOOTH_VER_1_2)
 		return 0;
+
+	/* Wait for HCI_EV_CONN_COMPLETE, not HCI_EV_CMD_STATUS, when the
+	 * reason is anything but HCI_ERROR_REMOTE_POWER_OFF. This reason is
+	 * used when suspending or powering off, where we don't want to wait
+	 * for the peer's response.
+	 */
+	if (reason != HCI_ERROR_REMOTE_POWER_OFF)
+		return __hci_cmd_sync_status_sk(hdev, HCI_OP_CREATE_CONN_CANCEL,
+						6, &conn->dst,
+						HCI_EV_CONN_COMPLETE,
+						HCI_CMD_TIMEOUT, NULL);
 
 	return __hci_cmd_sync_status(hdev, HCI_OP_CREATE_CONN_CANCEL,
 				     6, &conn->dst, HCI_CMD_TIMEOUT);
@@ -5320,10 +5333,26 @@ static int hci_reject_sco_sync(struct hci_dev *hdev, struct hci_conn *conn,
 				     sizeof(cp), &cp, HCI_CMD_TIMEOUT);
 }
 
+static int hci_le_reject_cis_sync(struct hci_dev *hdev, struct hci_conn *conn,
+				  u8 reason)
+{
+	struct hci_cp_le_reject_cis cp;
+
+	memset(&cp, 0, sizeof(cp));
+	cp.handle = cpu_to_le16(conn->handle);
+	cp.reason = reason;
+
+	return __hci_cmd_sync_status(hdev, HCI_OP_LE_REJECT_CIS,
+				     sizeof(cp), &cp, HCI_CMD_TIMEOUT);
+}
+
 static int hci_reject_conn_sync(struct hci_dev *hdev, struct hci_conn *conn,
 				u8 reason)
 {
 	struct hci_cp_reject_conn_req cp;
+
+	if (conn->type == ISO_LINK)
+		return hci_le_reject_cis_sync(hdev, conn, reason);
 
 	if (conn->type == SCO_LINK || conn->type == ESCO_LINK)
 		return hci_reject_sco_sync(hdev, conn, reason);
@@ -5340,6 +5369,7 @@ int hci_abort_conn_sync(struct hci_dev *hdev, struct hci_conn *conn, u8 reason)
 {
 	int err = 0;
 	u16 handle = conn->handle;
+	bool disconnect = false;
 	struct hci_conn *c;
 
 	switch (conn->state) {
@@ -5354,27 +5384,31 @@ int hci_abort_conn_sync(struct hci_dev *hdev, struct hci_conn *conn, u8 reason)
 		err = hci_reject_conn_sync(hdev, conn, reason);
 		break;
 	case BT_OPEN:
-		/* Cleanup bises that failed to be established */
-		if (test_and_clear_bit(HCI_CONN_BIG_SYNC_FAILED, &conn->flags)) {
-			hci_dev_lock(hdev);
-			hci_conn_failed(conn, reason);
-			hci_dev_unlock(hdev);
-		}
-		break;
-	default:
 		hci_dev_lock(hdev);
-		conn->state = BT_CLOSED;
-		hci_disconn_cfm(conn, reason);
-		hci_conn_del(conn);
+
+		/* Cleanup bis or pa sync connections */
+		if (test_and_clear_bit(HCI_CONN_BIG_SYNC_FAILED, &conn->flags) ||
+		    test_and_clear_bit(HCI_CONN_PA_SYNC_FAILED, &conn->flags)) {
+			hci_conn_failed(conn, reason);
+		} else if (test_bit(HCI_CONN_PA_SYNC, &conn->flags) ||
+			   test_bit(HCI_CONN_BIG_SYNC, &conn->flags)) {
+			conn->state = BT_CLOSED;
+			hci_disconn_cfm(conn, reason);
+			hci_conn_del(conn);
+		}
+
 		hci_dev_unlock(hdev);
 		return 0;
+	case BT_BOUND:
+		break;
+	default:
+		disconnect = true;
+		break;
 	}
 
 	hci_dev_lock(hdev);
 
-	/* Check if the connection hasn't been cleanup while waiting
-	 * commands to complete.
-	 */
+	/* Check if the connection has been cleaned up concurrently */
 	c = hci_conn_hash_lookup_handle(hdev, handle);
 	if (!c || c != conn) {
 		err = 0;
@@ -5386,7 +5420,13 @@ int hci_abort_conn_sync(struct hci_dev *hdev, struct hci_conn *conn, u8 reason)
 	 * or in case of LE it was still scanning so it can be cleanup
 	 * safely.
 	 */
-	hci_conn_failed(conn, reason);
+	if (disconnect) {
+		conn->state = BT_CLOSED;
+		hci_disconn_cfm(conn, reason);
+		hci_conn_del(conn);
+	} else {
+		hci_conn_failed(conn, reason);
+	}
 
 unlock:
 	hci_dev_unlock(hdev);
@@ -6515,7 +6555,7 @@ int hci_get_random_address(struct hci_dev *hdev, bool require_privacy,
 
 static int _update_adv_data_sync(struct hci_dev *hdev, void *data)
 {
-	u8 instance = PTR_ERR(data);
+	u8 instance = PTR_UINT(data);
 
 	return hci_update_adv_data_sync(hdev, instance);
 }
@@ -6523,5 +6563,5 @@ static int _update_adv_data_sync(struct hci_dev *hdev, void *data)
 int hci_update_adv_data(struct hci_dev *hdev, u8 instance)
 {
 	return hci_cmd_sync_queue(hdev, _update_adv_data_sync,
-				  ERR_PTR(instance), NULL);
+				  UINT_PTR(instance), NULL);
 }

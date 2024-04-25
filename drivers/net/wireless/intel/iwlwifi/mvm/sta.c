@@ -2096,8 +2096,6 @@ int iwl_mvm_rm_sta(struct iwl_mvm *mvm,
 	if (ret)
 		return ret;
 
-	cancel_work_sync(&mvm_sta->rs_init_wk);
-
 	/* flush its queues here since we are freeing mvm_sta */
 	ret = iwl_mvm_flush_sta(mvm, mvm_sta, false);
 	if (ret)

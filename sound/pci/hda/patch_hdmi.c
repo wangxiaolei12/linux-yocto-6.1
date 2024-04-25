@@ -3758,6 +3758,26 @@ static int nvhdmi_chmap_validate(struct hdac_chmap *chmap,
 	return 0;
 }
 
+/* map from pin NID to port; port is 0-based */
+/* for Nvidia: assume widget NID starting from 4, with step 1 (4, 5, 6, ...) */
+static int nvhdmi_pin2port(void *audio_ptr, int pin_nid)
+{
+	return pin_nid - 4;
+}
+
+/* reverse-map from port to pin NID: see above */
+static int nvhdmi_port2pin(struct hda_codec *codec, int port)
+{
+	return port + 4;
+}
+
+static const struct drm_audio_component_audio_ops nvhdmi_audio_ops = {
+	.pin2port = nvhdmi_pin2port,
+	.pin_eld_notify = generic_acomp_pin_eld_notify,
+	.master_bind = generic_acomp_master_bind,
+	.master_unbind = generic_acomp_master_unbind,
+};
+
 static int patch_nvhdmi(struct hda_codec *codec)
 {
 	struct hdmi_spec *spec;
@@ -3786,6 +3806,8 @@ static int patch_nvhdmi(struct hda_codec *codec)
 	spec->nv_dp_workaround = true;
 
 	codec->link_down_at_suspend = 1;
+
+	generic_acomp_init(codec, &nvhdmi_audio_ops, nvhdmi_port2pin);
 
 	return 0;
 }
@@ -4610,8 +4632,9 @@ HDA_CODEC_ENTRY(0x80862819, "DG2 HDMI",	patch_i915_tgl_hdmi),
 HDA_CODEC_ENTRY(0x8086281a, "Jasperlake HDMI",	patch_i915_icl_hdmi),
 HDA_CODEC_ENTRY(0x8086281b, "Elkhartlake HDMI",	patch_i915_icl_hdmi),
 HDA_CODEC_ENTRY(0x8086281c, "Alderlake-P HDMI", patch_i915_adlp_hdmi),
-HDA_CODEC_ENTRY(0x8086281f, "Raptorlake-P HDMI",	patch_i915_adlp_hdmi),
-HDA_CODEC_ENTRY(0x8086281d, "Meteorlake HDMI",	patch_i915_adlp_hdmi),
+HDA_CODEC_ENTRY(0x8086281d, "Meteor Lake HDMI",	patch_i915_adlp_hdmi),
+HDA_CODEC_ENTRY(0x8086281f, "Raptor Lake P HDMI",	patch_i915_adlp_hdmi),
+HDA_CODEC_ENTRY(0x80862820, "Lunar Lake HDMI",	patch_i915_adlp_hdmi),
 HDA_CODEC_ENTRY(0x80862880, "CedarTrail HDMI",	patch_generic_hdmi),
 HDA_CODEC_ENTRY(0x80862882, "Valleyview2 HDMI",	patch_i915_byt_hdmi),
 HDA_CODEC_ENTRY(0x80862883, "Braswell HDMI",	patch_i915_byt_hdmi),
