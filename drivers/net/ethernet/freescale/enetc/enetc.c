@@ -1909,6 +1909,15 @@ static void enetc_xdp_drop(struct enetc_bdr *rx_ring, int rx_ring_first,
 	}
 }
 
+static int enetc_xdp_num_bd(struct enetc_bdr *rx_ring, int rx_ring_first,
+			    int rx_ring_last)
+{
+	if (rx_ring_first <= rx_ring_last)
+		return rx_ring_last - rx_ring_first;
+
+	return rx_ring->bd_count - rx_ring_first + rx_ring_last;
+}
+
 static int enetc_clean_rx_ring_xdp(struct enetc_bdr *rx_ring,
 				   struct napi_struct *napi, int work_limit,
 				   struct bpf_prog *prog)
